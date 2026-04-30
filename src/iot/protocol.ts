@@ -90,7 +90,7 @@ export async function kasaIotCall(options: KasaIotOptions, command: Record<strin
             return out;
         };
 
-        socket.on('data', chunk => {
+        socket.on('data', (chunk: Buffer) => {
             chunks.push(chunk);
             queuedBytes += chunk.length;
             if (expected < 0) {

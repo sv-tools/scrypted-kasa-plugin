@@ -153,7 +153,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     };
 
     const HEADER_TERMINATOR = Buffer.from('\r\n\r\n');
-    client.on('data', chunk => {
+    client.on('data', (chunk: Buffer) => {
         buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
         // Parse messages until we run out of complete ones in the buffer.
         while (buffered.length > 0) {
