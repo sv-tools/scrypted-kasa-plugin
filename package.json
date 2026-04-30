@@ -1,0 +1,75 @@
+{
+   "name": "scrypted-kasa",
+   "version": "1.0.0",
+   "description": "TP-Link Kasa plugin for Scrypted — cameras (video, two-way audio, spotlight, siren, status LED), plugs/outlets, wall switches, dimmers, and smart bulbs (on/off, brightness, color, color temperature).",
+   "author": "Sergey Vilgelm <sergey@vilgelm.com>",
+   "license": "MIT",
+   "repository": {
+      "type": "git",
+      "url": "git+https://github.com/sv-tools/scrypted-kasa-plugin.git"
+   },
+   "bugs": {
+      "url": "https://github.com/sv-tools/scrypted-kasa-plugin/issues"
+   },
+   "homepage": "https://github.com/sv-tools/scrypted-kasa-plugin#readme",
+   "scripts": {
+      "scrypted-setup-project": "scrypted-setup-project",
+      "prescrypted-setup-project": "scrypted-package-json",
+      "build": "scrypted-webpack",
+      "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+      "prescrypted-vscode-launch": "scrypted-webpack",
+      "scrypted-vscode-launch": "scrypted-deploy-debug",
+      "scrypted-deploy-debug": "scrypted-deploy-debug",
+      "scrypted-debug": "scrypted-debug",
+      "scrypted-deploy": "scrypted-deploy",
+      "scrypted-readme": "scrypted-readme",
+      "scrypted-package-json": "scrypted-package-json",
+      "fmt": "prettier --write \"src/**/*.ts\"",
+      "fmt:check": "prettier --check \"src/**/*.ts\"",
+      "lint": "eslint src",
+      "lint:fix": "eslint src --fix"
+   },
+   "keywords": [
+      "scrypted",
+      "scrypted-plugin",
+      "plugin",
+      "kasa",
+      "tp-link",
+      "tplink",
+      "smarthome",
+      "smart-home",
+      "homekit",
+      "camera",
+      "intercom",
+      "two-way-audio",
+      "switch",
+      "outlet",
+      "plug",
+      "dimmer",
+      "bulb",
+      "light",
+      "lightbulb"
+   ],
+   "scrypted": {
+      "name": "Kasa Plugin",
+      "type": "DeviceProvider",
+      "interfaces": [
+         "ScryptedSystemDevice",
+         "ScryptedDeviceCreator",
+         "DeviceProvider",
+         "DeviceCreator",
+         "DeviceDiscovery"
+      ],
+      "pluginDependencies": [
+         "@scrypted/prebuffer-mixin"
+      ]
+   },
+   "devDependencies": {
+      "@eslint/js": "^10.0.1",
+      "@scrypted/sdk": "^0.5.59",
+      "@types/node": "^24.12.2",
+      "eslint": "^10.2.1",
+      "prettier": "^3.8.3",
+      "typescript-eslint": "^8.59.1"
+   }
+}
