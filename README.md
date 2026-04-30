@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/scrypted-kasa.svg)](https://www.npmjs.com/package/scrypted-kasa)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Adds support for the TP-Link Kasa device family to Scrypted: cameras, plugs/outlets,
+Adds support for the TP-Link Kasa device family to [Scrypted](https://www.scrypted.app): cameras, plugs/outlets,
 switches/dimmers, and bulbs. Discovery is unified — one UDP/9999 sweep finds everything
 and the plugin routes each device to the right Scrypted interfaces.
 
