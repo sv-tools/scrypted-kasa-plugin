@@ -278,6 +278,19 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     const videoPipe = cp.stdio[3] as Writable;
     const audioPipe = cp.stdio[4] as Writable;
 
+    // Attach 'error' listeners on both pipes IMMEDIATELY. When cleanupAll calls cp.kill,
+    // ffmpeg's stdio FDs close forcibly and any in-flight pump write throws ECONNRESET /
+    // EPIPE on the writable side. Without listeners, Node turns those into
+    // uncaughtException and crashes the whole plugin worker (taking down every camera).
+    // The `_e` arg is intentional — we just want the stream to be informed there's a
+    // listener.
+    videoPipe.on('error', _e => {
+        /* tear down via the kasa pump's own try/finally */
+    });
+    audioPipe.on('error', _e => {
+        /* tear down via the kasa pump's own try/finally */
+    });
+
     let resolveExited!: () => void;
     const exited = new Promise<void>(r => {
         resolveExited = r;
