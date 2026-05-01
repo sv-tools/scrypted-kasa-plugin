@@ -562,7 +562,7 @@ interface KasaDiscoveryEntry {
     timeout: NodeJS.Timeout;
 }
 
-class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery {
+class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery, Settings {
     devices = new Map<string, KasaCamera | KasaPlug | KasaSwitch | KasaDimmer | KasaBulb>();
     discoveredDevices = new Map<string, KasaDiscoveryEntry>();
     // In-flight scan so concurrent scan=true calls share one network round-trip instead of
@@ -580,6 +580,72 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
             deviceCreator: 'Device',
             deviceDiscovery: 'Kasa Devices',
         };
+    }
+
+    // Plugin Settings tab — read-only inventory of every adopted Kasa device with its
+    // model, firmware version, and IP. Useful for spotting which devices need a firmware
+    // update and which have rotated IPs without rediscovery. Grouped by device type.
+    async getSettings(): Promise<Setting[]> {
+        interface Entry {
+            name: string;
+            model: string;
+            firmware: string;
+            ip: string;
+            mac: string;
+        }
+        const groups: Record<string, Entry[]> = {
+            Cameras: [],
+            'Bulbs / Dimmers': [],
+            Plugs: [],
+            Switches: [],
+        };
+
+        for (const nativeId of deviceManager.getNativeIds()) {
+            if (!nativeId) continue;
+            // Skip child devices (spotlight/siren) — they share the parent camera's
+            // firmware so listing them separately would be noisy and misleading.
+            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+
+            const state = deviceManager.getDeviceState(nativeId);
+            if (!state) continue;
+
+            const type = state.type as ScryptedDeviceType | undefined;
+            const info = (state.info || {}) as { model?: string; firmware?: string; ip?: string; mac?: string };
+            const entry: Entry = {
+                name: state.name || '<unknown>',
+                model: info.model || '?',
+                firmware: info.firmware || '?',
+                ip: info.ip || '?',
+                mac: info.mac || '?',
+            };
+
+            if (type === ScryptedDeviceType.Camera) groups['Cameras'].push(entry);
+            else if (type === ScryptedDeviceType.Light) groups['Bulbs / Dimmers'].push(entry);
+            else if (type === ScryptedDeviceType.Outlet) groups['Plugs'].push(entry);
+            else if (type === ScryptedDeviceType.Switch) groups['Switches'].push(entry);
+        }
+
+        const settings: Setting[] = [];
+        for (const [groupName, entries] of Object.entries(groups)) {
+            if (!entries.length) continue;
+            // Sort by name within each group for stable display.
+            entries.sort((a, b) => a.name.localeCompare(b.name));
+            for (const e of entries) {
+                settings.push({
+                    group: groupName,
+                    key: `info-${e.mac}`,
+                    title: e.name,
+                    description: `${e.model} • ${e.ip}`,
+                    value: e.firmware,
+                    readonly: true,
+                });
+            }
+        }
+        return settings;
+    }
+
+    async putSetting(_key: string, _value: SettingValue): Promise<void> {
+        // All settings on this page are read-only inventory entries — nothing to persist.
     }
 
     async getCreateDeviceSettings(): Promise<Setting[]> {

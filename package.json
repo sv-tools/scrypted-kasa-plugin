@@ -58,7 +58,8 @@
          "ScryptedDeviceCreator",
          "DeviceProvider",
          "DeviceCreator",
-         "DeviceDiscovery"
+         "DeviceDiscovery",
+         "Settings"
       ],
       "pluginDependencies": [
          "@scrypted/prebuffer-mixin"
