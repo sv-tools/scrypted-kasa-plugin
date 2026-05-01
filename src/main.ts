@@ -683,8 +683,11 @@ class KasaPlugin
         // All settings on this page are read-only inventory entries — nothing to persist.
     }
 
-    // Plugin Readme tab — same inventory data the Settings page shows, but as a markdown
-    // table per group. Slightly nicer for at-a-glance review and copy/pasting.
+    // Plugin Readme tab — same inventory data the Settings page shows, formatted as
+    // pre-aligned text inside fenced code blocks. We avoid GFM-style pipe tables because
+    // Scrypted's markdown renderer is plain CommonMark — it doesn't recognize them and
+    // collapses the pipe rows into a single paragraph. A fenced code block renders as
+    // monospace preformatted text in any CommonMark renderer and preserves alignment.
     async getReadmeMarkdown(): Promise<string> {
         const groups = this.inventory();
         const lines: string[] = ['# Kasa Plugin', '', 'Adopted devices, grouped by type.', ''];
@@ -695,18 +698,24 @@ class KasaPlugin
             return mac.match(/.{2}/g)!.join(':').toUpperCase();
         };
 
+        const headers = ['Name', 'Model', 'IP', 'MAC', 'Firmware'];
         let total = 0;
         for (const groupName of INVENTORY_GROUPS) {
             const entries = groups[groupName];
             if (!entries.length) continue;
             total += entries.length;
-            lines.push(`## ${groupName} (${entries.length})`, '');
-            lines.push('| Name | Model | IP | MAC | Firmware |');
-            lines.push('|------|-------|----|-----|----------|');
-            for (const e of entries) {
-                lines.push(`| ${e.name} | ${e.model} | ${e.ip} | ${fmtMac(e.mac)} | ${e.firmware} |`);
+
+            const rows: string[][] = [headers, ...entries.map(e => [e.name, e.model, e.ip, fmtMac(e.mac), e.firmware])];
+            // Compute per-column widths so columns line up cleanly inside the code block.
+            const widths = headers.map((_, col) => Math.max(...rows.map(r => r[col].length)));
+
+            lines.push(`## ${groupName} (${entries.length})`, '', '```');
+            for (const row of rows) {
+                // Two-space gutter between columns is enough to keep them visually distinct
+                // without making the block too wide for narrow detail panels.
+                lines.push(row.map((cell, col) => cell.padEnd(widths[col])).join('  '));
             }
-            lines.push('');
+            lines.push('```', '');
         }
 
         if (total === 0) lines.push('_No devices adopted yet._');
