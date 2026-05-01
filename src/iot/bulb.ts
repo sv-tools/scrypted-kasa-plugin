@@ -126,7 +126,7 @@ export class KasaBulb
             '',
             '## Protocol',
             '',
-            'Local TCP/9999 — Kasa\'s legacy "smarthome" wire format. All bulb state changes',
+            `Local TCP/${port} — Kasa's legacy "smarthome" wire format. All bulb state changes`,
             'are issued via `smartlife.iot.smartbulb.lightingservice.transition_light_state`.',
         ].join('\n');
     }

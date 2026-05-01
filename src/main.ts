@@ -328,6 +328,7 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         const info = this.info || {};
         const { ip, port } = this.storageSettings.values;
         const ipLine = ip || info.ip || '?';
+        const streamPort = port || KASA_DEFAULT_PORT;
         return [
             `# ${this.name || 'Kasa Camera'}`,
             '',
@@ -340,18 +341,19 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
                 ['Serial', info.serialNumber || '?'],
                 ['MAC', formatKasaMac(info.mac)],
                 ['IP', ipLine],
-                ['Stream port', String(port || KASA_DEFAULT_PORT)],
+                ['Stream port', String(streamPort)],
             ]),
             '```',
             '',
             '## Endpoints',
             '',
-            'The plugin talks to the camera over three separate HTTPS endpoints — they are not',
-            'configurable, just listed here for diagnostic visibility:',
+            'The plugin talks to the camera over three separate HTTPS endpoints. The talk and',
+            'control endpoints are fixed in the camera firmware; the stream port can be edited',
+            "in the camera's Settings tab if needed:",
             '',
             '```',
             renderKv([
-                ['Stream', `https://${ipLine}:${KASA_DEFAULT_PORT}/https/stream/mixed`],
+                ['Stream', `https://${ipLine}:${streamPort}/https/stream/mixed`],
                 ['Talk', `https://${ipLine}:${KASA_TALK_PORT}/https/speaker/audio/g711block`],
                 ['Control', `https://${ipLine}:10443/data/LINKIE2.json`],
             ]),
@@ -733,11 +735,11 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         return groups;
     }
 
-    // Plugin Readme tab — same inventory data the Settings page shows, formatted as
-    // pre-aligned text inside fenced code blocks. We avoid GFM-style pipe tables because
-    // Scrypted's markdown renderer is plain CommonMark — it doesn't recognize them and
-    // collapses the pipe rows into a single paragraph. A fenced code block renders as
-    // monospace preformatted text in any CommonMark renderer and preserves alignment.
+    // Plugin Readme tab — inventory data formatted as pre-aligned text inside fenced
+    // code blocks. We avoid GFM-style pipe tables because Scrypted's markdown renderer
+    // is plain CommonMark — it doesn't recognize them and collapses the pipe rows into
+    // a single paragraph. A fenced code block renders as monospace preformatted text in
+    // any CommonMark renderer and preserves alignment.
     async getReadmeMarkdown(): Promise<string> {
         const groups = this.inventory();
         const lines: string[] = ['# Kasa Plugin', '', 'Adopted devices, grouped by type.', ''];

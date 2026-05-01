@@ -79,7 +79,7 @@ export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff,
             '',
             '## Protocol',
             '',
-            'Local TCP/9999 — Kasa\'s legacy "smarthome" wire format. No cloud account or',
+            `Local TCP/${port} — Kasa's legacy "smarthome" wire format. No cloud account or`,
             'credentials required, the plugin reaches the device directly on the LAN.',
         ].join('\n');
     }
