@@ -1206,7 +1206,13 @@ class KasaPlugin
     }
 
     async adoptDevice(adopt: AdoptDevice): Promise<string> {
-        const entry = this.discoveredDevices.get(adopt.nativeId);
+        // ScryptedNativeId is `string | undefined`; the AdoptDevice flow always passes
+        // a real id (it came from a DiscoveredDevice we ourselves emitted), but TS6
+        // tightened the inference and won't narrow it for us.
+        const nativeId = adopt.nativeId;
+        if (!nativeId) throw new Error('adoptDevice called without a nativeId');
+
+        const entry = this.discoveredDevices.get(nativeId);
         if (!entry) throw new Error('kasa device not found in discovered set; rescan and try again');
 
         const { device } = entry;
@@ -1217,32 +1223,33 @@ class KasaPlugin
         const room = adopt.settings.room?.toString() || undefined;
 
         let id: string;
-        if (cls === 'camera') id = await this.adoptCamera(adopt, device, name, room);
-        else id = await this.adoptIotDevice(adopt, device, cls, name, room);
+        if (cls === 'camera') id = await this.adoptCamera(adopt, nativeId, device, name, room);
+        else id = await this.adoptIotDevice(adopt, nativeId, device, cls, name, room);
 
         clearTimeout(entry.timeout);
-        this.discoveredDevices.delete(adopt.nativeId);
+        this.discoveredDevices.delete(nativeId);
         void this.onDeviceEvent(ScryptedInterface.DeviceDiscovery, undefined);
         return id;
     }
 
     private async adoptCamera(
         adopt: AdoptDevice,
+        nativeId: string,
         device: KasaDiscoveredDevice,
         name: string,
         room?: string,
     ): Promise<string> {
         // deviceId is the Kasa-issued 40-char hex per-unit identifier — treat it as the
         // serial number, which is what HomeKit and the UI expect under that label.
-        await this.registerCamera(adopt.nativeId, name, room, {
+        await this.registerCamera(nativeId, name, room, {
             model: device.model,
             mac: device.mac,
             ip: device.address,
             serialNumber: device.deviceId,
             firmware: typeof device.sysinfo?.sw_ver === 'string' ? device.sysinfo.sw_ver : undefined,
         });
-        deviceManager.getDeviceStorage(adopt.nativeId).setItem('kasaClass', 'camera');
-        const camera = (await this.getDevice(adopt.nativeId)) as KasaCamera;
+        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', 'camera');
+        const camera = (await this.getDevice(nativeId)) as KasaCamera;
 
         camera.storageSettings.values.ip = device.address;
         camera.storageSettings.values.port = KASA_DEFAULT_PORT;
@@ -1257,6 +1264,7 @@ class KasaPlugin
 
     private async adoptIotDevice(
         adopt: AdoptDevice,
+        nativeId: string,
         device: KasaDiscoveredDevice,
         cls: KasaDeviceClass,
         name: string,
@@ -1289,7 +1297,7 @@ class KasaPlugin
 
         const sw_ver = typeof device.sysinfo?.sw_ver === 'string' ? device.sysinfo.sw_ver : undefined;
         await deviceManager.onDeviceDiscovered({
-            nativeId: adopt.nativeId,
+            nativeId,
             name,
             type,
             interfaces,
@@ -1307,9 +1315,9 @@ class KasaPlugin
         // Persist the class marker so getDevice routes to the right implementation —
         // multiple device classes share the same Scrypted device type (true bulbs and
         // dimmers both register as Light).
-        deviceManager.getDeviceStorage(adopt.nativeId).setItem('kasaClass', storedClass);
+        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', storedClass);
 
-        const dev = await this.getDevice(adopt.nativeId);
+        const dev = await this.getDevice(nativeId);
         dev.storageSettings.values.ip = device.address;
         dev.storageSettings.values.port = KASA_IOT_PORT;
         if (cls === 'bulb' && dev instanceof KasaBulb) {
@@ -1324,7 +1332,10 @@ class KasaPlugin
     // Routes a nativeId to the right device class. Adoption persists a `kasaClass` storage
     // marker (camera/plug/switch/bulb) which is the source of truth here — the Scrypted
     // device type alone is ambiguous (e.g. both true bulbs and dimmer plugs are `Light`).
-    async getDevice(nativeId: string): Promise<any> {
+    async getDevice(nativeId: ScryptedNativeId): Promise<any> {
+        // The DeviceProvider contract types nativeId as nullable; the plugin device itself
+        // (no nativeId) routes here too and we have nothing to instantiate for it.
+        if (!nativeId) return undefined;
         let dev = this.devices.get(nativeId);
         if (!dev) {
             dev = this.instantiateDevice(nativeId);
