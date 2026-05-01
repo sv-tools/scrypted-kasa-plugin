@@ -614,11 +614,15 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         };
     }
 
-    // Walks every adopted device, reads each one's persisted info (populated at adoption
-    // time from sysinfo.sw_ver and friends), and groups by Scrypted device type. Shared by
-    // the Settings tab (getSettings) and the Readme tab (getReadmeMarkdown). Child devices
-    // (spotlight / siren under each camera) are filtered out — they share the parent
-    // camera's firmware so listing them separately is just noise.
+    // Walks every adopted device and groups by Scrypted device type for the Readme
+    // inventory. Child devices (spotlight / siren under each camera) are filtered out —
+    // they share the parent camera's firmware so listing them separately is just noise.
+    //
+    // IP comes from per-device storage (the value the plugin actually uses to connect)
+    // rather than `state.info.ip` (only set at adoption, doesn't reflect a manual edit
+    // in per-device Settings or a DHCP-rotated update). Falls back to info.ip if the
+    // storage value is missing — defends against legacy adoption paths that didn't
+    // initialize the storage.
     private inventory(): Record<InventoryGroup, InventoryEntry[]> {
         const groups: Record<InventoryGroup, InventoryEntry[]> = {
             Cameras: [],
@@ -636,11 +640,12 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
 
             const type = state.type as ScryptedDeviceType | undefined;
             const info = (state.info || {}) as { model?: string; firmware?: string; ip?: string; mac?: string };
+            const storedIp = deviceManager.getDeviceStorage(nativeId)?.getItem('ip');
             const entry: InventoryEntry = {
                 name: state.name || '<unknown>',
                 model: info.model || '?',
                 firmware: info.firmware || '?',
-                ip: info.ip || '?',
+                ip: storedIp || info.ip || '?',
                 mac: info.mac || '?',
             };
 
