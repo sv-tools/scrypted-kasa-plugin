@@ -27,9 +27,12 @@ const KASA_STREAM_CONNECT_TIMEOUT_MS = 10000;
 // Initial idle before the OS sends the first TCP keepalive probe on the streaming socket.
 // During normal streaming, frame-level data activity resets this timer so probes never
 // fire. If the connection dies (Wi-Fi drop, NAT timeout, switch reset), keepalive probes
-// fail and the OS closes the socket — our `body.on('close')` then triggers teardown.
-// Linux defaults are way too slow for a live video stream (TCP_KEEPIDLE = 7200 s); 30 s
-// gets us out of stuck-stream limbo within a few minutes worst case.
+// eventually cause the OS to close the socket and our `body.on('close')` triggers teardown.
+// Note: `socket.setKeepAlive(true, initialDelay)` controls only this initial idle period
+// (TCP_KEEPIDLE); total detection/teardown time still depends on OS-level keepalive
+// interval (TCP_KEEPINTVL) and probe count (TCP_KEEPCNT). Linux defaults are often too
+// slow for a live video stream (TCP_KEEPIDLE may default to 7200 s), so 30 s here just
+// starts probing sooner after the stream goes idle.
 const KASA_STREAM_KEEPALIVE_INITIAL_DELAY_MS = 30000;
 
 export const KasaMimeVideo = 'video/x-h264';
