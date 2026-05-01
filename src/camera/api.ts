@@ -14,11 +14,13 @@ export const KASA_STREAM_PATH = '/https/stream/mixed';
 // retaining memory.
 const MAX_HEADER_BYTES = 32 * 1024;
 
-// Socket idle timeout. Doubles as a connect timeout (a camera that's reachable on TCP but
-// never finishes TLS / never sends headers will hit this) AND as a stream-stall timeout
-// (real cameras stream continuously; a 10 s silence means the camera or network is dead).
-// Without this, a hung camera causes getVideoStream to block indefinitely.
-const KASA_STREAM_IDLE_TIMEOUT_MS = 10000;
+// Connect-only timeout: fires if the camera doesn't return response headers within this
+// window. Covers TLS handshake hangs and unresponsive-but-routable cameras. Once the
+// response arrives we clear the socket timeout — kasa cameras over marginal Wi-Fi can go
+// briefly silent (channel scan, AP roam, transient congestion) and recover, so an idle
+// timeout on the live stream causes more harm than good. Stream-level teardown is still
+// covered by `body.on('close')` / `body.on('error')` downstream.
+const KASA_STREAM_CONNECT_TIMEOUT_MS = 10000;
 
 export const KasaMimeVideo = 'video/x-h264';
 export const KasaMimeG711U = 'audio/g711u';
@@ -99,9 +101,6 @@ export class KasaClient {
 
         // Cameras present a self-signed cert. The body is consumed as a long-lived stream
         // rather than buffered to completion, so we don't read the response body here.
-        // The setTimeout below covers both the initial connect/handshake and ongoing stream
-        // idleness — Node's socket idle timeout resets on activity, so a continuously
-        // streaming camera never trips it; only stalls or unanswered handshakes do.
         const response = await new Promise<IncomingMessage>((resolve, reject) => {
             const req = https.request(
                 {
@@ -116,10 +115,16 @@ export class KasaClient {
                         Connection: 'keep-alive',
                     },
                 },
-                resolve,
+                response => {
+                    // Headers in — clear the connect timeout so it doesn't keep firing as
+                    // an idle timeout on the live stream. setTimeout(0) on the underlying
+                    // socket disables Node's idle-timeout machinery.
+                    response.socket?.setTimeout(0);
+                    resolve(response);
+                },
             );
-            req.setTimeout(KASA_STREAM_IDLE_TIMEOUT_MS, () => {
-                req.destroy(new Error(`kasa stream socket idle timeout after ${KASA_STREAM_IDLE_TIMEOUT_MS}ms`));
+            req.setTimeout(KASA_STREAM_CONNECT_TIMEOUT_MS, () => {
+                req.destroy(new Error(`kasa stream connect timeout after ${KASA_STREAM_CONNECT_TIMEOUT_MS}ms`));
             });
             req.on('error', reject);
             req.end();
