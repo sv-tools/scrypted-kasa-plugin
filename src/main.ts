@@ -10,6 +10,7 @@ import sdk, {
     Intercom,
     MediaObject,
     OnOff,
+    Readme,
     RequestMediaStreamOptions,
     ResponseMediaStreamOptions,
     ScryptedDeviceBase,
@@ -562,7 +563,21 @@ interface KasaDiscoveryEntry {
     timeout: NodeJS.Timeout;
 }
 
-class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery, Settings {
+interface InventoryEntry {
+    name: string;
+    model: string;
+    firmware: string;
+    ip: string;
+    mac: string;
+}
+
+const INVENTORY_GROUPS = ['Cameras', 'Bulbs / Dimmers', 'Plugs', 'Switches'] as const;
+type InventoryGroup = (typeof INVENTORY_GROUPS)[number];
+
+class KasaPlugin
+    extends ScryptedDeviceBase
+    implements DeviceProvider, DeviceCreator, DeviceDiscovery, Settings, Readme
+{
     devices = new Map<string, KasaCamera | KasaPlug | KasaSwitch | KasaDimmer | KasaBulb>();
     discoveredDevices = new Map<string, KasaDiscoveryEntry>();
     // In-flight scan so concurrent scan=true calls share one network round-trip instead of
@@ -582,18 +597,13 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         };
     }
 
-    // Plugin Settings tab — read-only inventory of every adopted Kasa device with its
-    // model, firmware version, and IP. Useful for spotting which devices need a firmware
-    // update and which have rotated IPs without rediscovery. Grouped by device type.
-    async getSettings(): Promise<Setting[]> {
-        interface Entry {
-            name: string;
-            model: string;
-            firmware: string;
-            ip: string;
-            mac: string;
-        }
-        const groups: Record<string, Entry[]> = {
+    // Walks every adopted device, reads each one's persisted info (populated at adoption
+    // time from sysinfo.sw_ver and friends), and groups by Scrypted device type. Shared by
+    // the Settings tab (getSettings) and the Readme tab (getReadmeMarkdown). Child devices
+    // (spotlight / siren under each camera) are filtered out — they share the parent
+    // camera's firmware so listing them separately is just noise.
+    private inventory(): Record<InventoryGroup, InventoryEntry[]> {
+        const groups: Record<InventoryGroup, InventoryEntry[]> = {
             Cameras: [],
             'Bulbs / Dimmers': [],
             Plugs: [],
@@ -602,8 +612,6 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
 
         for (const nativeId of deviceManager.getNativeIds()) {
             if (!nativeId) continue;
-            // Skip child devices (spotlight/siren) — they share the parent camera's
-            // firmware so listing them separately would be noisy and misleading.
             if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
 
             const state = deviceManager.getDeviceState(nativeId);
@@ -611,7 +619,7 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
 
             const type = state.type as ScryptedDeviceType | undefined;
             const info = (state.info || {}) as { model?: string; firmware?: string; ip?: string; mac?: string };
-            const entry: Entry = {
+            const entry: InventoryEntry = {
                 name: state.name || '<unknown>',
                 model: info.model || '?',
                 firmware: info.firmware || '?',
@@ -625,11 +633,18 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
             else if (type === ScryptedDeviceType.Switch) groups['Switches'].push(entry);
         }
 
+        // Sort by name within each group for stable display order across renders.
+        for (const entries of Object.values(groups)) entries.sort((a, b) => a.name.localeCompare(b.name));
+        return groups;
+    }
+
+    // Plugin Settings tab — read-only inventory of every adopted Kasa device with its
+    // model, firmware version, and IP. Useful for spotting which devices need a firmware
+    // update and which have rotated IPs without rediscovery.
+    async getSettings(): Promise<Setting[]> {
+        const groups = this.inventory();
         const settings: Setting[] = [];
         for (const [groupName, entries] of Object.entries(groups)) {
-            if (!entries.length) continue;
-            // Sort by name within each group for stable display.
-            entries.sort((a, b) => a.name.localeCompare(b.name));
             for (const e of entries) {
                 settings.push({
                     group: groupName,
@@ -646,6 +661,36 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
 
     async putSetting(_key: string, _value: SettingValue): Promise<void> {
         // All settings on this page are read-only inventory entries — nothing to persist.
+    }
+
+    // Plugin Readme tab — same inventory data the Settings page shows, but as a markdown
+    // table per group. Slightly nicer for at-a-glance review and copy/pasting.
+    async getReadmeMarkdown(): Promise<string> {
+        const groups = this.inventory();
+        const lines: string[] = ['# Kasa Plugin', '', 'Adopted devices, grouped by type.', ''];
+
+        // Format a hex MAC (e.g. "F0090D49721F") with colon separators (e.g. "F0:09:0D:49:72:1F").
+        const fmtMac = (mac: string): string => {
+            if (mac === '?' || mac.length !== 12) return mac;
+            return mac.match(/.{2}/g)!.join(':').toUpperCase();
+        };
+
+        let total = 0;
+        for (const groupName of INVENTORY_GROUPS) {
+            const entries = groups[groupName];
+            if (!entries.length) continue;
+            total += entries.length;
+            lines.push(`## ${groupName} (${entries.length})`, '');
+            lines.push('| Name | Model | IP | MAC | Firmware |');
+            lines.push('|------|-------|----|-----|----------|');
+            for (const e of entries) {
+                lines.push(`| ${e.name} | ${e.model} | ${e.ip} | ${fmtMac(e.mac)} | ${e.firmware} |`);
+            }
+            lines.push('');
+        }
+
+        if (total === 0) lines.push('_No devices adopted yet._');
+        return lines.join('\n');
     }
 
     async getCreateDeviceSettings(): Promise<Setting[]> {
