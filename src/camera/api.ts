@@ -14,13 +14,26 @@ export const KASA_STREAM_PATH = '/https/stream/mixed';
 // retaining memory.
 const MAX_HEADER_BYTES = 32 * 1024;
 
-// Connect-only timeout: fires if the camera doesn't return response headers within this
-// window. Covers TLS handshake hangs and unresponsive-but-routable cameras. Once the
-// response arrives we clear the socket timeout — kasa cameras over marginal Wi-Fi can go
-// briefly silent (channel scan, AP roam, transient congestion) and recover, so an idle
-// timeout on the live stream causes more harm than good. Stream-level teardown is still
-// covered by `body.on('close')` / `body.on('error')` downstream.
+// Connect-phase idle timeout: while establishing the HTTPS request and waiting for response
+// headers, fires only if the socket is idle for this long. Covers TLS handshake hangs and
+// unresponsive-but-routable cameras — but it's not a strict wall-clock deadline if there
+// is intermittent socket activity without headers arriving. Once headers arrive we clear
+// the socket timeout because kasa cameras on marginal Wi-Fi can go briefly silent (channel
+// scan, AP roam, transient congestion) and recover; killing the stream on every such gap
+// causes more harm than good. Half-open TCP detection is delegated to OS keepalive (see
+// setKeepAlive below) so a Wi-Fi drop without a clean FIN still gets cleaned up.
 const KASA_STREAM_CONNECT_TIMEOUT_MS = 10000;
+
+// Initial idle before the OS sends the first TCP keepalive probe on the streaming socket.
+// During normal streaming, frame-level data activity resets this timer so probes never
+// fire. If the connection dies (Wi-Fi drop, NAT timeout, switch reset), keepalive probes
+// eventually cause the OS to close the socket and our `body.on('close')` triggers teardown.
+// Note: `socket.setKeepAlive(true, initialDelay)` controls only this initial idle period
+// (TCP_KEEPIDLE); total detection/teardown time still depends on OS-level keepalive
+// interval (TCP_KEEPINTVL) and probe count (TCP_KEEPCNT). Linux defaults are often too
+// slow for a live video stream (TCP_KEEPIDLE may default to 7200 s), so 30 s here just
+// starts probing sooner after the stream goes idle.
+const KASA_STREAM_KEEPALIVE_INITIAL_DELAY_MS = 30000;
 
 export const KasaMimeVideo = 'video/x-h264';
 export const KasaMimeG711U = 'audio/g711u';
@@ -116,10 +129,17 @@ export class KasaClient {
                     },
                 },
                 response => {
-                    // Headers in — clear the connect timeout so it doesn't keep firing as
-                    // an idle timeout on the live stream. setTimeout(0) on the underlying
-                    // socket disables Node's idle-timeout machinery.
+                    // Headers in — clear the connect-phase idle timeout so it doesn't
+                    // keep firing during normal streaming gaps. setTimeout(0) on the
+                    // underlying socket disables Node's idle-timeout machinery.
                     response.socket?.setTimeout(0);
+                    // Enable OS-level TCP keepalive as a safety net for half-open
+                    // detection. During normal streaming the data flow keeps this from
+                    // firing, but if Wi-Fi drops / NAT times out without a clean FIN,
+                    // keepalive probes will eventually fail and the kernel will close
+                    // the socket — without keepalive we'd block forever in readPart()
+                    // waiting for a multipart header that never arrives.
+                    response.socket?.setKeepAlive(true, KASA_STREAM_KEEPALIVE_INITIAL_DELAY_MS);
                     resolve(response);
                 },
             );
