@@ -1,5 +1,6 @@
-import { OnOff, ScryptedDeviceBase, Setting, Settings, SettingValue } from '@scrypted/sdk';
+import { OnOff, Readme, ScryptedDeviceBase, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { formatKasaMac, renderKv } from '../shared/readme';
 import { KASA_IOT_PORT, getSysInfo, kasaIotCall } from './protocol';
 
 const STATE_POLL_INTERVAL_MS = 30000;
@@ -13,7 +14,7 @@ const STATE_POLL_INTERVAL_MS = 30000;
 //   query:     {"system":{"get_sysinfo":{}}}
 //
 // Multi-outlet strips (HS300, KP303) aren't modeled — they need per-child relay handling.
-export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff, Settings {
+export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff, Settings, Readme {
     storageSettings = new StorageSettings(this, {
         ip: {
             title: 'IP Address',
@@ -53,6 +54,34 @@ export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff,
 
     putSetting(key: string, value: SettingValue): Promise<void> {
         return this.storageSettings.putSetting(key, value);
+    }
+
+    // Per-device Readme tab. Surfaces static identity / network info — live state
+    // (on/off, brightness) is not duplicated here, the device page already shows it.
+    async getReadmeMarkdown(): Promise<string> {
+        const info = this.info || {};
+        const ip = this.storageSettings.values.ip || info.ip || '?';
+        const port = this.storageSettings.values.port || KASA_IOT_PORT;
+        return [
+            `# ${this.name || 'Kasa Device'}`,
+            '',
+            '## Device',
+            '',
+            '```',
+            renderKv([
+                ['Model', info.model || '?'],
+                ['Firmware', info.firmware || '?'],
+                ['MAC', formatKasaMac(info.mac)],
+                ['IP', ip],
+                ['Port', String(port)],
+            ]),
+            '```',
+            '',
+            '## Protocol',
+            '',
+            'Local TCP/9999 — Kasa\'s legacy "smarthome" wire format. No cloud account or',
+            'credentials required, the plugin reaches the device directly on the LAN.',
+        ].join('\n');
     }
 
     async turnOn(): Promise<void> {
