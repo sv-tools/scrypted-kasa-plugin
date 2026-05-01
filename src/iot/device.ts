@@ -1,4 +1,4 @@
-import { OnOff, Readme, ScryptedDeviceBase, Setting, Settings, SettingValue } from '@scrypted/sdk';
+import { OnOff, Readme, ScryptedDeviceBase, ScryptedInterface, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { formatKasaMac, renderKv } from '../shared/readme';
 import { EmeterReading, KASA_IOT_PORT, getEmeterRealtime, getSysInfo, kasaIotCall } from './protocol';
@@ -56,11 +56,65 @@ export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff,
         }, jitter);
     }
 
-    getSettings(): Promise<Setting[]> {
-        return this.storageSettings.getSettings();
+    async getSettings(): Promise<Setting[]> {
+        const base = await this.storageSettings.getSettings();
+        if (!this.storageSettings.values.hasEmeter) return base;
+
+        // Devices with an emeter get a live readout block + a Refresh button so the user
+        // can force a fresh sample without waiting for the 5 s cache to expire. Reads go
+        // through the same cached emeterRealtime() the Readme uses, so opening the
+        // Settings tab right after viewing the Readme is free.
+        const reading = await this.emeterRealtime();
+        const energy: Setting[] = [
+            {
+                key: 'energyPower',
+                group: 'Energy',
+                title: 'Power',
+                readonly: true,
+                value: reading ? `${reading.powerW.toFixed(1)} W` : '?',
+            },
+            {
+                key: 'energyVoltage',
+                group: 'Energy',
+                title: 'Voltage',
+                readonly: true,
+                value: reading ? `${reading.voltageV.toFixed(1)} V` : '?',
+            },
+            {
+                key: 'energyCurrent',
+                group: 'Energy',
+                title: 'Current',
+                readonly: true,
+                value: reading ? `${reading.currentA.toFixed(3)} A` : '?',
+            },
+            {
+                key: 'energyTotal',
+                group: 'Energy',
+                title: 'Total energy',
+                readonly: true,
+                value: reading ? `${(reading.totalWh / 1000).toFixed(3)} kWh` : '?',
+            },
+            {
+                key: 'refreshEnergy',
+                group: 'Energy',
+                title: 'Refresh',
+                description: 'Discard the cached emeter sample and read fresh values from the device.',
+                type: 'button',
+            },
+        ];
+        return [...base, ...energy];
     }
 
-    putSetting(key: string, value: SettingValue): Promise<void> {
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key === 'refreshEnergy') {
+            // Drop the cached value and fetch fresh; the new reading goes back into the
+            // cache so subsequent renders see it. Emit a Settings event so the UI knows
+            // to re-render with the updated readout fields.
+            this.emeterCache = undefined;
+            await this.emeterRealtime();
+            await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+            return;
+        }
         return this.storageSettings.putSetting(key, value);
     }
 
