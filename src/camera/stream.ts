@@ -49,6 +49,17 @@ export interface KasaStreamOptions {
     kasa: KasaClient;
     ffmpegPath: string;
     console: Console;
+    // Optional cached SPS/PPS from a previous session. When present we skip the
+    // preScanSpsPps wait (which holds getVideoStream up to ~2s on KC420WS waiting for the
+    // next IDR) and start streaming live parts immediately. Cached values come from this
+    // camera's own previous bitstream so they're correct unless the encoder profile
+    // changed (resolution / bitrate setting); even when stale, the in-band SPS/PPS that
+    // arrive with the next IDR will replace them at the consumer's decoder.
+    cachedSps?: Buffer;
+    cachedPps?: Buffer;
+    // Called when we successfully scanned fresh SPS/PPS from the live bitstream. The
+    // caller persists these so subsequent sessions can use the cached path.
+    onFreshSpsPps?: (sps: Buffer, pps: Buffer) => void;
 }
 
 export interface KasaStreamHandle {
@@ -233,9 +244,30 @@ async function pumpKasa(
 // Returns a handle whose `kill()` tears down everything (kasa, ffmpeg, UDP sockets, TCP
 // server, active client) and whose `exited` promise resolves once that teardown is done.
 export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStreamHandle> {
-    const { kasa, ffmpegPath, console } = opts;
+    const { kasa, ffmpegPath, console, cachedSps, cachedPps, onFreshSpsPps } = opts;
 
-    const { sps, pps, buffered } = await preScanSpsPps(kasa);
+    // Fast path: caller supplied cached SPS/PPS from a previous session. Skip the scan and
+    // start streaming live parts immediately — saves the ~1-2s preScanSpsPps wait on cold
+    // starts, which dominates HomeKit's perceived stream-open latency.
+    let sps: Buffer;
+    let pps: Buffer;
+    let buffered: KasaPart[];
+    if (cachedSps && cachedPps) {
+        sps = cachedSps;
+        pps = cachedPps;
+        buffered = [];
+    } else {
+        const scanned = await preScanSpsPps(kasa);
+        sps = scanned.sps;
+        pps = scanned.pps;
+        buffered = scanned.buffered;
+        // Persist for next time.
+        try {
+            onFreshSpsPps?.(sps, pps);
+        } catch (e) {
+            console.warn('[kasa-stream] onFreshSpsPps callback threw', (e as Error).message);
+        }
+    }
     const sdp = buildSdp(sps, pps);
 
     const videoUdp = await bindUdpPair();

@@ -389,9 +389,29 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         kasa.body.on('error', () => kill.resolve());
 
         const ffmpegPath = await mediaManager.getFFmpegPath();
+        // Read cached SPS/PPS from per-device storage. Lets spawnKasaStream skip the
+        // ~1-2s preScanSpsPps wait on cold starts (HomeKit's perceived latency dominates
+        // here). Cache survives plugin restarts. Stale-cache risk is bounded — in-band
+        // SPS/PPS in the live bitstream supersede whatever we put in the SDP.
+        const storage = deviceManager.getDeviceStorage(this.nativeId);
+        const cachedSpsB64 = storage?.getItem('cachedSps') || undefined;
+        const cachedPpsB64 = storage?.getItem('cachedPps') || undefined;
+        const cachedSps = cachedSpsB64 ? Buffer.from(cachedSpsB64, 'base64') : undefined;
+        const cachedPps = cachedPpsB64 ? Buffer.from(cachedPpsB64, 'base64') : undefined;
+
         let stream: KasaStreamHandle;
         try {
-            stream = await spawnKasaStream({ kasa, ffmpegPath, console: this.console });
+            stream = await spawnKasaStream({
+                kasa,
+                ffmpegPath,
+                console: this.console,
+                cachedSps,
+                cachedPps,
+                onFreshSpsPps: (sps, pps) => {
+                    storage?.setItem('cachedSps', sps.toString('base64'));
+                    storage?.setItem('cachedPps', pps.toString('base64'));
+                },
+            });
         } catch (e) {
             kasa.destroy();
             throw e;
