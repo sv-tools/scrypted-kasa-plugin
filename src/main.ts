@@ -594,10 +594,7 @@ interface InventoryEntry {
 const INVENTORY_GROUPS = ['Cameras', 'Bulbs / Dimmers', 'Plugs', 'Switches'] as const;
 type InventoryGroup = (typeof INVENTORY_GROUPS)[number];
 
-class KasaPlugin
-    extends ScryptedDeviceBase
-    implements DeviceProvider, DeviceCreator, DeviceDiscovery, Settings, Readme
-{
+class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery, Readme {
     devices = new Map<string, KasaCamera | KasaPlug | KasaSwitch | KasaDimmer | KasaBulb>();
     discoveredDevices = new Map<string, KasaDiscoveryEntry>();
     // In-flight scan so concurrent scan=true calls share one network round-trip instead of
@@ -656,31 +653,6 @@ class KasaPlugin
         // Sort by name within each group for stable display order across renders.
         for (const entries of Object.values(groups)) entries.sort((a, b) => a.name.localeCompare(b.name));
         return groups;
-    }
-
-    // Plugin Settings tab — read-only inventory of every adopted Kasa device with its
-    // model, firmware version, and IP. Useful for spotting which devices need a firmware
-    // update and which have rotated IPs without rediscovery.
-    async getSettings(): Promise<Setting[]> {
-        const groups = this.inventory();
-        const settings: Setting[] = [];
-        for (const [groupName, entries] of Object.entries(groups)) {
-            for (const e of entries) {
-                settings.push({
-                    group: groupName,
-                    key: `info-${e.mac}`,
-                    title: e.name,
-                    description: `${e.model} • ${e.ip}`,
-                    value: e.firmware,
-                    readonly: true,
-                });
-            }
-        }
-        return settings;
-    }
-
-    async putSetting(_key: string, _value: SettingValue): Promise<void> {
-        // All settings on this page are read-only inventory entries — nothing to persist.
     }
 
     // Plugin Readme tab — same inventory data the Settings page shows, formatted as

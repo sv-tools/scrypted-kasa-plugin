@@ -59,7 +59,6 @@
          "DeviceProvider",
          "DeviceCreator",
          "DeviceDiscovery",
-         "Settings",
          "Readme"
       ],
       "pluginDependencies": [
