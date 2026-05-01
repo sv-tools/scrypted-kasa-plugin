@@ -249,23 +249,43 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     // Fast path: caller supplied cached SPS/PPS from a previous session. Skip the scan and
     // start streaming live parts immediately — saves the ~1-2s preScanSpsPps wait on cold
     // starts, which dominates HomeKit's perceived stream-open latency.
+    // Validate cached buffers before trusting them. Storage corruption / schema drift /
+    // mistakenly-stored garbage would otherwise produce an SDP with an invalid
+    // profile-level-id (derived from sps[1..4]) or sprop-parameter-sets, and consumers
+    // would fail SETUP rather than recovering from in-band SPS/PPS.
+    // H.264 NAL header byte: low 5 bits = nal_unit_type. SPS = 7, PPS = 8.
+    // SPS minimum length = 4 (NAL header byte + 3 profile bytes used in the SDP).
+    const cacheValid =
+        !!cachedSps &&
+        !!cachedPps &&
+        cachedSps.length >= 4 &&
+        cachedPps.length >= 1 &&
+        (cachedSps[0] & 0x1f) === 7 &&
+        (cachedPps[0] & 0x1f) === 8;
+    if ((cachedSps || cachedPps) && !cacheValid) {
+        // Caller will overwrite the bad cache via onFreshSpsPps below once the slow path
+        // produces fresh values; nothing to do here beyond logging and falling through.
+        console.warn('[kasa-stream] cached SPS/PPS failed validation; falling back to in-band scan');
+    }
+
     let sps: Buffer;
     let pps: Buffer;
     let buffered: KasaPart[];
-    if (cachedSps && cachedPps) {
-        sps = cachedSps;
-        pps = cachedPps;
+    if (cacheValid) {
+        sps = cachedSps!;
+        pps = cachedPps!;
         buffered = [];
     } else {
         const scanned = await preScanSpsPps(kasa);
         sps = scanned.sps;
         pps = scanned.pps;
         buffered = scanned.buffered;
-        // Persist for next time.
+        // Persist for next time. Pass the original error object (not just .message) so
+        // stack/context survive — non-Error throws would lose everything otherwise.
         try {
             onFreshSpsPps?.(sps, pps);
         } catch (e) {
-            console.warn('[kasa-stream] onFreshSpsPps callback threw', (e as Error).message);
+            console.warn('[kasa-stream] onFreshSpsPps callback threw', e);
         }
     }
     const sdp = buildSdp(sps, pps);
