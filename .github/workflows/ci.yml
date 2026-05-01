@@ -11,6 +11,11 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only is enough — CI just builds and lints, doesn't push commits, comments, or
+# release artifacts.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest

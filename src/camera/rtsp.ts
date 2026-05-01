@@ -173,7 +173,10 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
             const headerLines = headerStr.split('\r\n');
             const requestLine = headerLines.shift() || '';
             const [method, uri] = requestLine.split(' ');
-            const headers: Record<string, string> = {};
+            // Null-prototype map so a malicious peer can't reach Object.prototype via a
+            // crafted header name like `__proto__`. Practical risk is tiny — the server
+            // only listens on localhost — but the fix is one line and shuts up CodeQL.
+            const headers = Object.create(null) as Record<string, string>;
             for (const line of headerLines) {
                 const colon = line.indexOf(':');
                 if (colon < 0) continue;
