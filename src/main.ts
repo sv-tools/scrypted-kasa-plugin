@@ -707,7 +707,25 @@ class KasaPlugin
             this.console.error('refresh: discovery failed', e);
             return [] as KasaDiscoveredDevice[];
         });
+
+        // Auto-discovered devices use the Kasa deviceId as their nativeId, but
+        // manually-created ones (createDevice) get a random nativeId — those would
+        // never match here. Build a MAC index too so we can fall back to matching by
+        // the MAC the device's `info` was stamped with.
+        const normalizeMac = (mac: string | undefined): string => (mac ? mac.replace(/[:-]/g, '').toLowerCase() : '');
         const byDeviceId = new Map(responses.map(r => [r.deviceId, r]));
+        const byMac = new Map<string, KasaDiscoveredDevice>();
+        for (const r of responses) {
+            const k = normalizeMac(r.mac);
+            if (k) byMac.set(k, r);
+        }
+
+        // Prefer the freshly-observed string when it's non-empty, otherwise keep the
+        // existing value. Discovery responses occasionally surface empty fields (and
+        // sw_ver may be missing entirely), and we don't want a refresh to clobber
+        // good cached data with an undefined.
+        const preferStr = (fresh: string | undefined, existing: string | undefined): string | undefined =>
+            fresh && fresh.trim() ? fresh : existing;
 
         let updated = 0;
         const missing: string[] = [];
@@ -719,20 +737,29 @@ class KasaPlugin
             const state = deviceManager.getDeviceState(nativeId);
             if (!state) continue;
 
-            const fresh = byDeviceId.get(nativeId);
+            // Try deviceId match first (auto-discovered), then MAC match (covers
+            // manually-created devices and any deviceId mismatches).
+            let fresh = byDeviceId.get(nativeId);
+            if (!fresh) {
+                const macKey = normalizeMac(state.info?.mac);
+                if (macKey) fresh = byMac.get(macKey);
+            }
             if (!fresh) {
                 missing.push(state.name || nativeId);
                 continue;
             }
 
+            const existing = state.info || {};
             const sw_ver = typeof fresh.sysinfo?.sw_ver === 'string' ? fresh.sysinfo.sw_ver : undefined;
             const newInfo = {
-                ...(state.info || {}),
+                ...existing,
                 manufacturer: 'TP-Link Kasa',
-                model: fresh.model,
-                mac: fresh.mac,
+                model: preferStr(fresh.model, existing.model),
+                mac: preferStr(fresh.mac, existing.mac),
+                // IP always takes the freshly-observed value — capturing a DHCP-rotated
+                // address is the whole point of the refresh.
                 ip: fresh.address,
-                firmware: sw_ver,
+                firmware: preferStr(sw_ver, existing.firmware),
             };
 
             // Re-publish without touching providedInterfaces — refreshing metadata, not
