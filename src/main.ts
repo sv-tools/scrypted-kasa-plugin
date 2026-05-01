@@ -655,7 +655,9 @@ class KasaPlugin
         super(nativeId);
         this.systemDevice = {
             deviceCreator: 'Device',
-            deviceDiscovery: 'Kasa Devices',
+            // Singular noun — Scrypted's UI auto-pluralizes the label, so 'Kasa Devices'
+            // would render as "Kasa Devicess".
+            deviceDiscovery: 'Kasa Device',
         };
         // Devices adopted before Readme was added need their interface lists topped up so
         // the Readme tab actually shows on the device page. Defer to next tick so the SDK
