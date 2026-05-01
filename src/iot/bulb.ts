@@ -4,12 +4,14 @@ import {
     ColorSettingHsv,
     ColorSettingTemperature,
     OnOff,
+    Readme,
     ScryptedDeviceBase,
     Setting,
     Settings,
     SettingValue,
 } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
+import { formatKasaMac, renderKv } from '../shared/readme';
 import { KASA_IOT_PORT, getSysInfo, kasaIotCall } from './protocol';
 
 const STATE_POLL_INTERVAL_MS = 30000;
@@ -26,7 +28,7 @@ const STATE_POLL_INTERVAL_MS = 30000;
 // in `getTemperatureMinK`/`getTemperatureMaxK` and fall back to a safe pair otherwise.
 export class KasaBulb
     extends ScryptedDeviceBase
-    implements OnOff, Brightness, ColorSettingHsv, ColorSettingTemperature, Settings
+    implements OnOff, Brightness, ColorSettingHsv, ColorSettingTemperature, Settings, Readme
 {
     storageSettings = new StorageSettings(this, {
         ip: {
@@ -84,6 +86,49 @@ export class KasaBulb
 
     putSetting(key: string, value: SettingValue): Promise<void> {
         return this.storageSettings.putSetting(key, value);
+    }
+
+    // Per-device Readme tab. Bulbs don't share KasaIotDevice's base implementation
+    // (different inheritance chain because of the color/brightness mixins), so the
+    // structure is duplicated here on purpose. Adds the static capability list (color /
+    // color-temp range) since those depend on per-model sysinfo flags. Live state is not
+    // duplicated here — the device page already shows it.
+    async getReadmeMarkdown(): Promise<string> {
+        const info = this.info || {};
+        const ip = this.storageSettings.values.ip || info.ip || '?';
+        const port = this.storageSettings.values.port || KASA_IOT_PORT;
+        const { isColor, isVariableColorTemp, colorTemperatureMinK, colorTemperatureMaxK } =
+            this.storageSettings.values;
+
+        const capabilities: string[] = ['Brightness'];
+        if (isColor) capabilities.push('Color (HSV)');
+        if (isVariableColorTemp)
+            capabilities.push(`Color temperature (${colorTemperatureMinK}–${colorTemperatureMaxK} K)`);
+
+        return [
+            `# ${this.name || 'Kasa Bulb'}`,
+            '',
+            '## Device',
+            '',
+            '```',
+            renderKv([
+                ['Model', info.model || '?'],
+                ['Firmware', info.firmware || '?'],
+                ['MAC', formatKasaMac(info.mac)],
+                ['IP', ip],
+                ['Port', String(port)],
+            ]),
+            '```',
+            '',
+            '## Capabilities',
+            '',
+            ...capabilities.map(c => `- ${c}`),
+            '',
+            '## Protocol',
+            '',
+            `Local TCP/${port} — Kasa's legacy "smarthome" wire format. All bulb state changes`,
+            'are issued via `smartlife.iot.smartbulb.lightingservice.transition_light_state`.',
+        ].join('\n');
     }
 
     async turnOn(): Promise<void> {

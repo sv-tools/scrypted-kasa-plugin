@@ -10,6 +10,7 @@ import sdk, {
     Intercom,
     MediaObject,
     OnOff,
+    Readme,
     RequestMediaStreamOptions,
     ResponseMediaStreamOptions,
     ScryptedDeviceBase,
@@ -35,6 +36,7 @@ import { KasaPlug } from './iot/plug';
 import { KASA_IOT_PORT } from './iot/protocol';
 import { KasaSwitch } from './iot/switch';
 import { discoverKasa, KasaDiscoveredDevice } from './shared/discovery';
+import { formatKasaMac, renderKv } from './shared/readme';
 
 // G.711 µ-law packetization: 8000 samples/sec * 1 byte/sample = 160 bytes/20ms.
 // 20 ms is the standard RTP packetization for PCMU and matches what the Kasa app appears
@@ -182,7 +184,7 @@ class KasaCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 }
 
-class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff {
+class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, Readme {
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
     private spotlight?: KasaCameraSpotlight;
@@ -316,6 +318,47 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
 
     getSettings(): Promise<Setting[]> {
         return this.storageSettings.getSettings();
+    }
+
+    // Per-camera Readme tab. Surfaces what the user can't easily see otherwise: the
+    // firmware/serial the adopted device reports and which HTTPS ports the plugin is
+    // talking to (stream / talk / control). Live state (LED on/off, spotlight on/off,
+    // motion, ...) is not duplicated here — the device page already shows it live.
+    async getReadmeMarkdown(): Promise<string> {
+        const info = this.info || {};
+        const { ip, port } = this.storageSettings.values;
+        const ipLine = ip || info.ip || '?';
+        const streamPort = port || KASA_DEFAULT_PORT;
+        return [
+            `# ${this.name || 'Kasa Camera'}`,
+            '',
+            '## Device',
+            '',
+            '```',
+            renderKv([
+                ['Model', info.model || '?'],
+                ['Firmware', info.firmware || '?'],
+                ['Serial', info.serialNumber || '?'],
+                ['MAC', formatKasaMac(info.mac)],
+                ['IP', ipLine],
+                ['Stream port', String(streamPort)],
+            ]),
+            '```',
+            '',
+            '## Endpoints',
+            '',
+            'The plugin talks to the camera over three separate HTTPS endpoints. The talk and',
+            'control endpoints are fixed in the camera firmware; the stream port can be edited',
+            "in the camera's Settings tab if needed:",
+            '',
+            '```',
+            renderKv([
+                ['Stream', `https://${ipLine}:${streamPort}/https/stream/mixed`],
+                ['Talk', `https://${ipLine}:${KASA_TALK_PORT}/https/speaker/audio/g711block`],
+                ['Control', `https://${ipLine}:10443/data/LINKIE2.json`],
+            ]),
+            '```',
+        ].join('\n');
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
@@ -582,7 +625,21 @@ interface KasaDiscoveryEntry {
     timeout: NodeJS.Timeout;
 }
 
-class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery {
+interface InventoryEntry {
+    name: string;
+    model: string;
+    firmware: string;
+    ip: string;
+    mac: string;
+}
+
+const INVENTORY_GROUPS = ['Cameras', 'Bulbs / Dimmers', 'Plugs', 'Switches'] as const;
+type InventoryGroup = (typeof INVENTORY_GROUPS)[number];
+
+class KasaPlugin
+    extends ScryptedDeviceBase
+    implements DeviceProvider, DeviceCreator, DeviceDiscovery, Readme, Settings
+{
     devices = new Map<string, KasaCamera | KasaPlug | KasaSwitch | KasaDimmer | KasaBulb>();
     discoveredDevices = new Map<string, KasaDiscoveryEntry>();
     // In-flight scan so concurrent scan=true calls share one network round-trip instead of
@@ -602,6 +659,246 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
             // would render as "Kasa Devicess".
             deviceDiscovery: 'Kasa Device',
         };
+        // Devices adopted before Readme was added need their interface lists topped up so
+        // the Readme tab actually shows on the device page. Defer to next tick so the SDK
+        // is fully wired before we walk the device manager.
+        process.nextTick(() => this.migrateAddReadme().catch(e => this.console.warn('migrateAddReadme failed', e)));
+    }
+
+    // Plugin Settings tab — single button that re-runs UDP discovery and refreshes the
+    // model / firmware / IP / MAC reported on every adopted device. Useful after a
+    // firmware update, a device rename in the Kasa app, or a DHCP-rotated IP.
+    async getSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'refresh',
+                title: 'Refresh devices',
+                description:
+                    'Re-run UDP discovery and update model, firmware, IP, and MAC for every adopted ' +
+                    'Kasa device. Devices not currently reachable on the LAN are skipped.',
+                type: 'button',
+            },
+        ];
+    }
+
+    async putSetting(key: string, _value: SettingValue): Promise<void> {
+        if (key === 'refresh') await this.refreshAllDevices();
+    }
+
+    // Shared in-flight promise so two clicks of the Refresh button don't kick off two
+    // overlapping discovery sweeps. Same pattern as scanInFlight in discoverDevices.
+    private refreshInFlight?: Promise<void>;
+
+    // Re-run UDP discovery and update each adopted device's `info` (model, firmware, IP,
+    // MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
+    // (powered off, on a different subnet) are left alone — we don't want to clobber
+    // good cached data with a one-shot network blip.
+    private async refreshAllDevices(): Promise<void> {
+        if (this.refreshInFlight) return this.refreshInFlight;
+        this.refreshInFlight = this.refreshAllDevicesInternal().finally(() => {
+            this.refreshInFlight = undefined;
+        });
+        return this.refreshInFlight;
+    }
+
+    private async refreshAllDevicesInternal(): Promise<void> {
+        this.console.log('refresh: running UDP discovery sweep');
+        const responses = await discoverKasa(2500, this.console).catch(e => {
+            this.console.error('refresh: discovery failed', e);
+            return [] as KasaDiscoveredDevice[];
+        });
+
+        // Auto-discovered devices use the Kasa deviceId as their nativeId, but
+        // manually-created ones (createDevice) get a random nativeId — those would
+        // never match here. Build a MAC index too so we can fall back to matching by
+        // the MAC the device's `info` was stamped with.
+        const normalizeMac = (mac: string | undefined): string => (mac ? mac.replace(/[:-]/g, '').toLowerCase() : '');
+        const byDeviceId = new Map(responses.map(r => [r.deviceId, r]));
+        const byMac = new Map<string, KasaDiscoveredDevice>();
+        for (const r of responses) {
+            const k = normalizeMac(r.mac);
+            if (k) byMac.set(k, r);
+        }
+
+        // Prefer the freshly-observed string when it's non-empty, otherwise keep the
+        // existing value. Discovery responses occasionally surface empty fields (and
+        // sw_ver may be missing entirely), and we don't want a refresh to clobber
+        // good cached data with an undefined.
+        const preferStr = (fresh: string | undefined, existing: string | undefined): string | undefined =>
+            fresh && fresh.trim() ? fresh : existing;
+
+        let updated = 0;
+        const missing: string[] = [];
+        for (const nativeId of deviceManager.getNativeIds()) {
+            if (!nativeId) continue;
+            // Spotlight / siren children share the parent camera's sysinfo and are
+            // already maintained by KasaCamera.refreshChildDevices.
+            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            const state = deviceManager.getDeviceState(nativeId);
+            if (!state) continue;
+
+            // Try deviceId match first (auto-discovered), then MAC match (covers
+            // manually-created devices and any deviceId mismatches).
+            let fresh = byDeviceId.get(nativeId);
+            if (!fresh) {
+                const macKey = normalizeMac(state.info?.mac);
+                if (macKey) fresh = byMac.get(macKey);
+            }
+            if (!fresh) {
+                missing.push(state.name || nativeId);
+                continue;
+            }
+
+            const existing = state.info || {};
+            const sw_ver = typeof fresh.sysinfo?.sw_ver === 'string' ? fresh.sysinfo.sw_ver : undefined;
+            const newInfo = {
+                ...existing,
+                manufacturer: 'TP-Link Kasa',
+                model: preferStr(fresh.model, existing.model),
+                mac: preferStr(fresh.mac, existing.mac),
+                // IP always takes the freshly-observed value — capturing a DHCP-rotated
+                // address is the whole point of the refresh.
+                ip: fresh.address,
+                firmware: preferStr(sw_ver, existing.firmware),
+            };
+
+            // Re-publish without touching providedInterfaces — refreshing metadata, not
+            // capabilities. Mixin-provided interfaces (HomeKit, etc.) live in `interfaces`
+            // and would be incorrectly re-claimed if we passed those back.
+            await deviceManager.onDeviceDiscovered({
+                nativeId,
+                name: state.name || nativeId,
+                type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
+                interfaces: state.providedInterfaces || [],
+                info: newInfo,
+                room: state.room || undefined,
+            });
+
+            // Keep per-device storage in sync — that's what the device classes actually
+            // use to connect. Update the in-memory storageSettings too if the device is
+            // already instantiated, otherwise it would keep using the stale IP until
+            // restarted.
+            const storage = deviceManager.getDeviceStorage(nativeId);
+            storage?.setItem('ip', fresh.address);
+            const dev = this.devices.get(nativeId);
+            if (dev?.storageSettings) dev.storageSettings.values.ip = fresh.address;
+
+            updated++;
+        }
+
+        const summary = `refresh: ${updated} updated, ${missing.length} not found on LAN`;
+        this.console.log(missing.length ? `${summary} (${missing.join(', ')})` : summary);
+    }
+
+    // One-time interface migration for devices adopted before this plugin exposed Readme.
+    // Walks every nativeId and re-publishes the device with Readme appended to its
+    // providedInterfaces. No-ops once every device already advertises Readme, so it's safe
+    // to leave running on every plugin start.
+    private async migrateAddReadme(): Promise<void> {
+        for (const nativeId of deviceManager.getNativeIds()) {
+            if (!nativeId) continue;
+            // Spotlight / siren children only expose OnOff — no Readme to add. They're
+            // re-published by KasaCamera.refreshChildDevices anyway.
+            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            const state = deviceManager.getDeviceState(nativeId);
+            if (!state) continue;
+            // providedInterfaces is the list this plugin originally registered; the
+            // `interfaces` field also includes mixin-provided interfaces (HomeKit, etc.)
+            // which we must NOT re-claim ownership of by passing them back to
+            // onDeviceDiscovered.
+            const provided = state.providedInterfaces || [];
+            if (provided.includes(ScryptedInterface.Readme)) continue;
+            await deviceManager.onDeviceDiscovered({
+                nativeId,
+                name: state.name || nativeId,
+                type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
+                interfaces: [...provided, ScryptedInterface.Readme],
+                info: state.info,
+                room: state.room || undefined,
+            });
+        }
+    }
+
+    // Walks every adopted device and groups by Scrypted device type for the Readme
+    // inventory. Child devices (spotlight / siren under each camera) are filtered out —
+    // they share the parent camera's firmware so listing them separately is just noise.
+    //
+    // IP comes from per-device storage (the value the plugin actually uses to connect)
+    // rather than `state.info.ip` (only set at adoption, doesn't reflect a manual edit
+    // in per-device Settings or a DHCP-rotated update). Falls back to info.ip if the
+    // storage value is missing — defends against legacy adoption paths that didn't
+    // initialize the storage.
+    private inventory(): Record<InventoryGroup, InventoryEntry[]> {
+        const groups: Record<InventoryGroup, InventoryEntry[]> = {
+            Cameras: [],
+            'Bulbs / Dimmers': [],
+            Plugs: [],
+            Switches: [],
+        };
+
+        for (const nativeId of deviceManager.getNativeIds()) {
+            if (!nativeId) continue;
+            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+
+            const state = deviceManager.getDeviceState(nativeId);
+            if (!state) continue;
+
+            const type = state.type as ScryptedDeviceType | undefined;
+            const info = (state.info || {}) as { model?: string; firmware?: string; ip?: string; mac?: string };
+            const storedIp = deviceManager.getDeviceStorage(nativeId)?.getItem('ip');
+            const entry: InventoryEntry = {
+                name: state.name || '<unknown>',
+                model: info.model || '?',
+                firmware: info.firmware || '?',
+                ip: storedIp || info.ip || '?',
+                mac: info.mac || '?',
+            };
+
+            if (type === ScryptedDeviceType.Camera) groups['Cameras'].push(entry);
+            else if (type === ScryptedDeviceType.Light) groups['Bulbs / Dimmers'].push(entry);
+            else if (type === ScryptedDeviceType.Outlet) groups['Plugs'].push(entry);
+            else if (type === ScryptedDeviceType.Switch) groups['Switches'].push(entry);
+        }
+
+        // Sort by name within each group for stable display order across renders.
+        for (const entries of Object.values(groups)) entries.sort((a, b) => a.name.localeCompare(b.name));
+        return groups;
+    }
+
+    // Plugin Readme tab — inventory data formatted as pre-aligned text inside fenced
+    // code blocks. We avoid GFM-style pipe tables because Scrypted's markdown renderer
+    // is plain CommonMark — it doesn't recognize them and collapses the pipe rows into
+    // a single paragraph. A fenced code block renders as monospace preformatted text in
+    // any CommonMark renderer and preserves alignment.
+    async getReadmeMarkdown(): Promise<string> {
+        const groups = this.inventory();
+        const lines: string[] = ['# Kasa Plugin', '', 'Adopted devices, grouped by type.', ''];
+
+        const headers = ['Name', 'Model', 'IP', 'MAC', 'Firmware'];
+        let total = 0;
+        for (const groupName of INVENTORY_GROUPS) {
+            const entries = groups[groupName];
+            if (!entries.length) continue;
+            total += entries.length;
+
+            const rows: string[][] = [
+                headers,
+                ...entries.map(e => [e.name, e.model, e.ip, formatKasaMac(e.mac), e.firmware]),
+            ];
+            // Compute per-column widths so columns line up cleanly inside the code block.
+            const widths = headers.map((_, col) => Math.max(...rows.map(r => r[col].length)));
+
+            lines.push(`## ${groupName} (${entries.length})`, '', '```');
+            for (const row of rows) {
+                // Two-space gutter between columns is enough to keep them visually distinct
+                // without making the block too wide for narrow detail panels.
+                lines.push(row.map((cell, col) => cell.padEnd(widths[col])).join('  '));
+            }
+            lines.push('```', '');
+        }
+
+        if (total === 0) lines.push('_No devices adopted yet._');
+        return lines.join('\n');
     }
 
     async getCreateDeviceSettings(): Promise<Setting[]> {
@@ -662,7 +959,7 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         room: string | undefined,
         kasaClass: KasaDeviceClass,
     ): Promise<void> {
-        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings];
+        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings, ScryptedInterface.Readme];
         let type: ScryptedDeviceType;
         switch (kasaClass) {
             case 'plug':
@@ -716,6 +1013,7 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
                 // OnOff drives the camera's status LED — HomeKit binds its
                 // CameraOperatingModeIndicator characteristic to this.
                 ScryptedInterface.OnOff,
+                ScryptedInterface.Readme,
             ],
             info: {
                 manufacturer: 'TP-Link Kasa',
@@ -793,6 +1091,7 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
                     ScryptedInterface.Intercom,
                     ScryptedInterface.DeviceProvider,
                     ScryptedInterface.OnOff,
+                    ScryptedInterface.Readme,
                 ],
                 info,
                 // Cameras need the cloud account credentials too — auth on the stream/talk
@@ -811,7 +1110,7 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         }
 
         // Plug, Switch, Bulb — all share the same simpler adoption form.
-        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings];
+        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings, ScryptedInterface.Readme];
         let type: ScryptedDeviceType;
         if (cls === 'bulb') {
             type = ScryptedDeviceType.Light;
@@ -963,7 +1262,11 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         name: string,
         room?: string,
     ): Promise<string> {
-        const interfaces: ScryptedInterface[] = [ScryptedInterface.OnOff, ScryptedInterface.Settings];
+        const interfaces: ScryptedInterface[] = [
+            ScryptedInterface.OnOff,
+            ScryptedInterface.Settings,
+            ScryptedInterface.Readme,
+        ];
         let type: ScryptedDeviceType;
         const caps = bulbCapabilities(device);
         // The marker we persist for getDevice routing. 'plug'/'switch' for plain on/off
