@@ -141,3 +141,42 @@ export async function getSysInfo(options: KasaIotOptions): Promise<KasaSysInfoCo
     const r = await kasaIotCall(options, { system: { get_sysinfo: {} } });
     return r?.system?.get_sysinfo;
 }
+
+// Energy-monitoring readout for plugs that report sysinfo.feature containing "ENE"
+// (HS110, KP115, KP125, EP25, HS220, ...). The plug answers `emeter.get_realtime` with
+// either the newer milli-units schema or the older base-unit schema:
+//
+//   newer:  { voltage_mv, current_ma, power_mw, total_wh, err_code }
+//   older:  { voltage,    current,    power,    total,    err_code }   // V, A, W, kWh
+//
+// Normalize to a single V/A/W/Wh shape so callers don't care which firmware they're on.
+// Returns undefined on err_code or when neither schema matches.
+export interface EmeterReading {
+    voltageV: number;
+    currentA: number;
+    powerW: number;
+    totalWh: number;
+}
+
+export async function getEmeterRealtime(options: KasaIotOptions): Promise<EmeterReading | undefined> {
+    const r = await kasaIotCall(options, { emeter: { get_realtime: {} } });
+    const e = r?.emeter?.get_realtime;
+    if (!e || e.err_code) return undefined;
+    if (typeof e.voltage_mv === 'number') {
+        return {
+            voltageV: e.voltage_mv / 1000,
+            currentA: (e.current_ma ?? 0) / 1000,
+            powerW: (e.power_mw ?? 0) / 1000,
+            totalWh: e.total_wh ?? 0,
+        };
+    }
+    if (typeof e.voltage === 'number') {
+        return {
+            voltageV: e.voltage,
+            currentA: e.current ?? 0,
+            powerW: e.power ?? 0,
+            totalWh: (e.total ?? 0) * 1000,
+        };
+    }
+    return undefined;
+}
