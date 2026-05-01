@@ -598,7 +598,9 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         super(nativeId);
         this.systemDevice = {
             deviceCreator: 'Device',
-            deviceDiscovery: 'Kasa Devices',
+            // Singular noun — Scrypted's UI auto-pluralizes the label, so 'Kasa Devices'
+            // would render as "Kasa Devicess".
+            deviceDiscovery: 'Kasa Device',
         };
     }
 
