@@ -636,7 +636,10 @@ interface InventoryEntry {
 const INVENTORY_GROUPS = ['Cameras', 'Bulbs / Dimmers', 'Plugs', 'Switches'] as const;
 type InventoryGroup = (typeof INVENTORY_GROUPS)[number];
 
-class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, DeviceDiscovery, Readme {
+class KasaPlugin
+    extends ScryptedDeviceBase
+    implements DeviceProvider, DeviceCreator, DeviceDiscovery, Readme, Settings
+{
     devices = new Map<string, KasaCamera | KasaPlug | KasaSwitch | KasaDimmer | KasaBulb>();
     discoveredDevices = new Map<string, KasaDiscoveryEntry>();
     // In-flight scan so concurrent scan=true calls share one network round-trip instead of
@@ -658,6 +661,104 @@ class KasaPlugin extends ScryptedDeviceBase implements DeviceProvider, DeviceCre
         // the Readme tab actually shows on the device page. Defer to next tick so the SDK
         // is fully wired before we walk the device manager.
         process.nextTick(() => this.migrateAddReadme().catch(e => this.console.warn('migrateAddReadme failed', e)));
+    }
+
+    // Plugin Settings tab — single button that re-runs UDP discovery and refreshes the
+    // model / firmware / IP / MAC reported on every adopted device. Useful after a
+    // firmware update, a device rename in the Kasa app, or a DHCP-rotated IP.
+    async getSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'refresh',
+                title: 'Refresh devices',
+                description:
+                    'Re-run UDP discovery and update model, firmware, IP, and MAC for every adopted ' +
+                    'Kasa device. Devices not currently reachable on the LAN are skipped.',
+                type: 'button',
+            },
+        ];
+    }
+
+    async putSetting(key: string, _value: SettingValue): Promise<void> {
+        if (key === 'refresh') await this.refreshAllDevices();
+    }
+
+    // Shared in-flight promise so two clicks of the Refresh button don't kick off two
+    // overlapping discovery sweeps. Same pattern as scanInFlight in discoverDevices.
+    private refreshInFlight?: Promise<void>;
+
+    // Re-run UDP discovery and update each adopted device's `info` (model, firmware, IP,
+    // MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
+    // (powered off, on a different subnet) are left alone — we don't want to clobber
+    // good cached data with a one-shot network blip.
+    private async refreshAllDevices(): Promise<void> {
+        if (this.refreshInFlight) return this.refreshInFlight;
+        this.refreshInFlight = this.refreshAllDevicesInternal().finally(() => {
+            this.refreshInFlight = undefined;
+        });
+        return this.refreshInFlight;
+    }
+
+    private async refreshAllDevicesInternal(): Promise<void> {
+        this.console.log('refresh: running UDP discovery sweep');
+        const responses = await discoverKasa(2500, this.console).catch(e => {
+            this.console.error('refresh: discovery failed', e);
+            return [] as KasaDiscoveredDevice[];
+        });
+        const byDeviceId = new Map(responses.map(r => [r.deviceId, r]));
+
+        let updated = 0;
+        const missing: string[] = [];
+        for (const nativeId of deviceManager.getNativeIds()) {
+            if (!nativeId) continue;
+            // Spotlight / siren children share the parent camera's sysinfo and are
+            // already maintained by KasaCamera.refreshChildDevices.
+            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            const state = deviceManager.getDeviceState(nativeId);
+            if (!state) continue;
+
+            const fresh = byDeviceId.get(nativeId);
+            if (!fresh) {
+                missing.push(state.name || nativeId);
+                continue;
+            }
+
+            const sw_ver = typeof fresh.sysinfo?.sw_ver === 'string' ? fresh.sysinfo.sw_ver : undefined;
+            const newInfo = {
+                ...(state.info || {}),
+                manufacturer: 'TP-Link Kasa',
+                model: fresh.model,
+                mac: fresh.mac,
+                ip: fresh.address,
+                firmware: sw_ver,
+            };
+
+            // Re-publish without touching providedInterfaces — refreshing metadata, not
+            // capabilities. Mixin-provided interfaces (HomeKit, etc.) live in `interfaces`
+            // and would be incorrectly re-claimed if we passed those back.
+            await deviceManager.onDeviceDiscovered({
+                nativeId,
+                name: state.name || nativeId,
+                type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
+                interfaces: state.providedInterfaces || [],
+                info: newInfo,
+                room: state.room || undefined,
+            });
+
+            // Keep per-device storage in sync — that's what the device classes actually
+            // use to connect. Update the in-memory storageSettings too if the device is
+            // already instantiated, otherwise it would keep using the stale IP until
+            // restarted.
+            const storage = deviceManager.getDeviceStorage(nativeId);
+            storage?.setItem('ip', fresh.address);
+            const dev = this.devices.get(nativeId);
+            if (dev?.storageSettings) dev.storageSettings.values.ip = fresh.address;
+
+            updated++;
+        }
+
+        const summary = `refresh: ${updated} updated, ${missing.length} not found on LAN`;
+        this.console.log(missing.length ? `${summary} (${missing.join(', ')})` : summary);
     }
 
     // One-time interface migration for devices adopted before this plugin exposed Readme.

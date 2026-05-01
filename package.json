@@ -59,7 +59,8 @@
          "DeviceProvider",
          "DeviceCreator",
          "DeviceDiscovery",
-         "Readme"
+         "Readme",
+         "Settings"
       ],
       "pluginDependencies": [
          "@scrypted/prebuffer-mixin"
