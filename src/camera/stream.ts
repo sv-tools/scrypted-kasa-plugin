@@ -229,10 +229,11 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     unregisterCleanup = registerLiveCleanup(cleanupAll);
 
     // Pump kasa parts directly into the active forwarder. No intermediate process, pipe,
-    // or UDP hop. Drops parts when no client is attached (start-up race or paused stream).
-    // Backpressure: handled inside rtsp.ts `send` — drops while the socket is full and
-    // tears down the client if the kernel buffer crosses a hard cap. From here we just
-    // call send and let it decide.
+    // or UDP hop. Drops parts until the RTSP client PLAYs (i.e. while `active` is null —
+    // start-up race only; we don't implement PAUSE semantics, since live consumers
+    // either keep playing or TEARDOWN). Backpressure: handled inside rtsp.ts `send` —
+    // drops while the socket is full and tears down the client if the kernel buffer
+    // crosses a hard cap. From here we just call send and let it decide.
     const pump = async () => {
         const t0 = process.hrtime.bigint();
         const replay = buffered;

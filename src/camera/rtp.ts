@@ -88,39 +88,32 @@ function writeRtpHeader(
 
 // Yields each NAL unit body (without the start code) found in an annex-b H.264 buffer.
 // Handles both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
+//
+// Single-pass via Buffer.indexOf — each byte is examined at most once, and the inner
+// scan is in native code (Boyer–Moore-ish), which matters for large IDR access units
+// containing many slice NALs (KC420WS IDRs run 80+ KB across dozens of slices).
+const NAL_START_CODE_3 = Buffer.from([0, 0, 1]);
 export function* annexbNalUnits(annexb: Buffer): IterableIterator<Buffer> {
     const len = annexb.length;
-    let i = 0;
-    while (i < len) {
-        let start = -1;
-        while (i + 2 < len) {
-            if (annexb[i] === 0 && annexb[i + 1] === 0) {
-                if (annexb[i + 2] === 1) {
-                    start = i + 3;
-                    break;
-                }
-                if (i + 3 < len && annexb[i + 2] === 0 && annexb[i + 3] === 1) {
-                    start = i + 4;
-                    break;
-                }
-            }
-            i++;
+    // body offset of the currently-open NAL, or -1 until the first start code is seen.
+    let nalStart = -1;
+    let searchFrom = 0;
+    while (searchFrom < len) {
+        const hit = annexb.indexOf(NAL_START_CODE_3, searchFrom);
+        if (hit < 0) break;
+        // 4-byte form (00 00 00 01) shows up as a 3-byte hit one byte in; treat the
+        // leading 0 as part of the start code so the NAL we're closing ends just before
+        // the full 4-byte sequence.
+        const codeStart = hit > 0 && annexb[hit - 1] === 0 ? hit - 1 : hit;
+        if (nalStart >= 0 && codeStart > nalStart) {
+            // Skip empty NALs (back-to-back start codes) defensively — not valid in a
+            // well-formed bitstream but a malformed part shouldn't poison the stream.
+            yield annexb.subarray(nalStart, codeStart);
         }
-        if (start < 0) return;
-        let end = len;
-        for (let j = start; j + 2 < len; j++) {
-            if (annexb[j] === 0 && annexb[j + 1] === 0) {
-                if (annexb[j + 2] === 1 || (j + 3 < len && annexb[j + 2] === 0 && annexb[j + 3] === 1)) {
-                    end = j;
-                    break;
-                }
-            }
-        }
-        // Skip empty NALs (back-to-back start codes) defensively — they aren't valid in
-        // well-formed bitstreams but a malformed part shouldn't poison the stream.
-        if (end > start) yield annexb.subarray(start, end);
-        i = end;
+        nalStart = hit + 3;
+        searchFrom = nalStart;
     }
+    if (nalStart >= 0 && len > nalStart) yield annexb.subarray(nalStart, len);
 }
 
 export type RtpSink = (packet: Buffer) => void;
