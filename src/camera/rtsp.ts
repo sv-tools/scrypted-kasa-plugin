@@ -153,6 +153,12 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     };
 
     const HEADER_TERMINATOR = Buffer.from('\r\n\r\n');
+    // Caps on accumulated buffer size. Server is localhost-only, but a misbehaving or
+    // malicious client could trickle bytes without ever sending the header terminator,
+    // or advertise a giant Content-Length, forcing `buffered` to grow unbounded via
+    // Buffer.concat. Real RTSP requests for the methods we accept are well under 1 KB.
+    const RTSP_MAX_HEADER_BYTES = 8 * 1024;
+    const RTSP_MAX_BODY_BYTES = 4 * 1024;
     client.on('data', (chunk: Buffer) => {
         buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
         // Parse messages until we run out of complete ones in the buffer.
@@ -168,7 +174,13 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 continue;
             }
             const headerEndIdx = buffered.indexOf(HEADER_TERMINATOR);
-            if (headerEndIdx < 0) return;
+            if (headerEndIdx < 0) {
+                if (buffered.length > RTSP_MAX_HEADER_BYTES) {
+                    opts.console.warn('rtsp: header section exceeded cap, dropping client');
+                    client.destroy();
+                }
+                return;
+            }
             const headerStr = buffered.subarray(0, headerEndIdx).toString('utf8');
             const headerLines = headerStr.split('\r\n');
             const requestLine = headerLines.shift() || '';
@@ -183,6 +195,11 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
             }
             const contentLength = parseInt(headers.get('content-length') || '0', 10);
+            if (!Number.isFinite(contentLength) || contentLength < 0 || contentLength > RTSP_MAX_BODY_BYTES) {
+                opts.console.warn('rtsp: invalid or oversized content-length', headers.get('content-length'));
+                client.destroy();
+                return;
+            }
             const totalLen = headerEndIdx + HEADER_TERMINATOR.length + contentLength;
             if (buffered.length < totalLen) return;
             // We currently ignore request bodies — none of the methods we handle need one.
