@@ -502,16 +502,56 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         // -loglevel error + -nostats: without these, ffmpeg emits a `size= time= bitrate=`
         // progress line every ~0.5 s during the talkback session. On long talks that's a
         // steady stream of stderr → string allocations + log I/O for no diagnostic value.
+        //
+        // Low-latency knobs (without these, talkback lagged ~10 s — the symptom was hearing
+        // your own voice through the camera speaker only after releasing Push-to-Talk):
+        //   -fflags +nobuffer  : skip libavformat's input prebuffer (typically 1-2 s on SDP/SRTP).
+        //   -fflags +flush_packets, -flush_packets 1
+        //                      : flush the AVIO output buffer after every encoded packet
+        //                        instead of when the 32 KB buffer fills (~4 s of 8 kHz mulaw).
+        //                        The two forms cover both global flags and the output-muxer
+        //                        explicit option; cheap belt-and-suspenders.
+        //   -flags low_delay   : codec-level low-delay decode/encode flag.
+        //   -probesize 32, -analyzeduration 0
+        //                      : skip the auto-detect probe phase, which would otherwise
+        //                        wait for ~5 s of audio to estimate stream parameters
+        //                        before producing the first output sample.
+        //   -rtsp_transport tcp
+        //                      : force TCP-interleaved RTP. The HomeKit plugin's localhost
+        //                        RTSP server supports both; default ffmpeg negotiation can
+        //                        pick UDP, which then engages a jitter buffer.
+        //   -max_delay 0, -reorder_queue_size 0
+        //                      : zero the RTSP demuxer's jitter buffer (default 500 ms) and
+        //                        out-of-order reordering window. Reordering on a localhost
+        //                        loop is impossible by construction, and the jitter buffer
+        //                        purely adds delay.
+        //   -af aresample=async=0:min_hard_comp=0
+        //                      : disable async resampling. ffmpeg auto-inserts aresample
+        //                        when input/output sample rates differ (Opus 24 kHz →
+        //                        mulaw 8 kHz); async=0 keeps it operating on tiny frames
+        //                        without the multi-second resync window async=1 introduces.
         // prettier-ignore
         const args = [
             '-hide_banner',
             '-loglevel', 'error',
             '-nostats',
+            '-fflags', '+nobuffer+flush_packets',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-rtsp_transport', 'tcp',
+            '-max_delay', '0',
+            '-reorder_queue_size', '0',
+            '-rtbufsize', '32',
+            '-thread_queue_size', '1',
+            '-use_wallclock_as_timestamps', '1',
             ...(ffmpegInput.inputArguments || []),
             '-vn', '-sn', '-dn',
+            '-af', 'aresample=async=0:min_hard_comp=0',
             '-f', 'mulaw',
             '-ar', '8000',
             '-ac', '1',
+            '-flush_packets', '1',
             'pipe:1',
         ];
         const cp = child_process.spawn(ffmpegPath, args);

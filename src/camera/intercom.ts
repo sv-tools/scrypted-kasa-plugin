@@ -77,6 +77,15 @@ export class KasaTalkSession {
 
         this.request = req;
 
+        // Disable Nagle on the underlying TCP socket as soon as it's available. Each 20 ms
+        // audio part we write is small (~230 B) and fewer than the segment size, so Nagle
+        // would coalesce parts waiting for an ACK or for the 200 ms deadline — adding
+        // user-perceptible chunkiness on top of the inherent network round-trip. The talk
+        // session is a constant low-rate stream, exactly the workload Nagle hurts.
+        req.on('socket', socket => {
+            socket.setNoDelay(true);
+        });
+
         req.on('error', e => {
             // Suppress when the close came first (deliberate teardown via close()): ending
             // the body mid-flight makes the in-flight HTTPS request emit "socket hang up"
@@ -127,12 +136,19 @@ export class KasaTalkSession {
 
     private writePart(contentType: string, body: Buffer): boolean {
         if (this.closed) return true;
-        const header = `--${TALK_BOUNDARY}\r\nContent-Length: ${body.length}\r\nContent-Type: ${contentType}\r\n\r\n`;
-        // Only the last write's return value matters for backpressure — if any of these
-        // fills the buffer, Node will emit `drain` after the buffer empties.
-        this.body.write(header);
-        if (body.length) this.body.write(body);
-        return this.body.write('\r\n');
+        const header = Buffer.from(
+            `--${TALK_BOUNDARY}\r\nContent-Length: ${body.length}\r\nContent-Type: ${contentType}\r\n\r\n`,
+        );
+        // Concat header + body + CRLF into one write. Three separate writes would each
+        // become its own chunked-encoding chunk on the HTTP body and (worse) its own TLS
+        // record + TCP segment. Cameras and Node's HTTP/TLS stack both prefer one part
+        // arriving as one segment — fewer per-packet ACKs and no risk of the camera
+        // partially parsing a part header before the body lands.
+        const trailer = Buffer.from('\r\n');
+        const out = body.length
+            ? Buffer.concat([header, body, trailer], header.length + body.length + trailer.length)
+            : Buffer.concat([header, trailer], header.length + trailer.length);
+        return this.body.write(out);
     }
 
     close(): void {
