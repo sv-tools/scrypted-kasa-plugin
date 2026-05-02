@@ -1,17 +1,12 @@
-import child_process from 'child_process';
-import dgram from 'dgram';
-import { once } from 'events';
 import net from 'net';
-import { Writable } from 'stream';
 import { findSpsPps, KasaClient, KasaMimeG711U, KasaMimeVideo, KasaPart } from './api';
+import { G711_CLOCK_HZ, G711RtpPacketizer, H264_CLOCK_HZ, H264RtpPacketizer, nowNtp } from './rtp';
 import { handleRtspClient } from './rtsp';
 
-// Process-level cleanup registry. Scrypted runs plugins as worker threads, and child
-// processes spawned by a worker survive the worker's termination — they're owned by the
-// host Node process. So when our plugin gets unloaded (or even when the worker crashes),
-// any in-flight ffmpeg subprocess + kasa HTTPS connection would otherwise leak. We catch
-// that here: every spawnKasaStream and intercom-ffmpeg registers its kill function and
-// removes itself on normal teardown. On worker exit, the hook nukes anything still live.
+// Process-level cleanup registry. Scrypted runs plugins as worker threads; resources
+// owned by the host Node process (TCP servers, kasa HTTPS connections) survive worker
+// termination otherwise. Every spawnKasaStream registers its kill function and removes
+// itself on normal teardown. On worker exit, the hook nukes anything still live.
 const liveCleanups = new Set<() => void>();
 let exitHookInstalled = false;
 function installExitHook() {
@@ -47,7 +42,6 @@ const SPS_PPS_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 
 export interface KasaStreamOptions {
     kasa: KasaClient;
-    ffmpegPath: string;
     console: Console;
     // Optional cached SPS/PPS from a previous session. When present we skip the
     // preScanSpsPps wait (which holds getVideoStream up to ~2s on KC420WS waiting for the
@@ -66,77 +60,6 @@ export interface KasaStreamHandle {
     url: string;
     kill(): void;
     exited: Promise<void>;
-}
-
-interface BoundUdp {
-    socket: dgram.Socket;
-    port: number;
-}
-
-interface UdpPair {
-    rtp: BoundUdp;
-    rtcp: BoundUdp;
-}
-
-// 1 MB UDP receive buffer — comfortably absorbs an IDR-frame burst on the localhost hop
-// from ffmpeg, which can be 100+ RTP packets arriving back-to-back. The default Linux
-// SO_RCVBUF (~200 KB) overflows on 1080p H.264 IDRs and drops fragments, surfacing as
-// "fua packet missing" in downstream consumers.
-const UDP_RECV_BUFFER_BYTES = 1024 * 1024;
-
-async function bindUdp(port: number = 0): Promise<BoundUdp> {
-    const sock = dgram.createSocket('udp4');
-    await new Promise<void>((resolve, reject) => {
-        const onError = (e: Error) => {
-            sock.removeListener('listening', onListen);
-            reject(e);
-        };
-        const onListen = () => {
-            sock.removeListener('error', onError);
-            resolve();
-        };
-        sock.once('error', onError);
-        sock.once('listening', onListen);
-        sock.bind(port, '127.0.0.1');
-    });
-    // setRecvBufferSize tries to bump SO_RCVBUF; the kernel caps it at net.core.rmem_max
-    // (often 200 KB on stock Linux, 2+ MB on most server distros). We don't fail if the
-    // bump is rejected — small buffer just means we may drop on big bursts.
-    try {
-        sock.setRecvBufferSize(UDP_RECV_BUFFER_BYTES);
-    } catch {
-        /* best-effort */
-    }
-    return { socket: sock, port: (sock.address() as { port: number }).port };
-}
-
-// Bind a (RTP, RTP+1) UDP pair so RTCP gets the conventional next port. ffmpeg's `-f rtp`
-// output assumes RTP+1 for RTCP unless rtcpport= overrides; binding the pair ourselves
-// keeps the wiring straightforward. Retry up to 10 times in case RTP+1 is already taken.
-async function bindUdpPair(): Promise<UdpPair> {
-    for (let attempt = 0; attempt < 10; attempt++) {
-        const rtp = await bindUdp();
-        try {
-            const rtcp = await bindUdp(rtp.port + 1);
-            return { rtp, rtcp };
-        } catch {
-            rtp.socket.close();
-        }
-    }
-    throw new Error('failed to bind sequential RTP/RTCP udp pair after 10 tries');
-}
-
-// Reserve a TCP port on localhost for the RTSP server. Brief TOCTOU window between close
-// and re-bind is accepted — nothing else snatches loopback ports in those few ms.
-async function reserveTcpPort(): Promise<number> {
-    return new Promise<number>((resolve, reject) => {
-        const probe = net.createServer();
-        probe.once('error', reject);
-        probe.listen(0, '127.0.0.1', () => {
-            const port = (probe.address() as net.AddressInfo).port;
-            probe.close(() => resolve(port));
-        });
-    });
 }
 
 // Build the SDP we serve on DESCRIBE. We embed sprop-parameter-sets so consumers can decode
@@ -183,68 +106,38 @@ async function preScanSpsPps(kasa: KasaClient): Promise<{ sps: Buffer; pps: Buff
     return { sps: found.sps!, pps: found.pps!, buffered };
 }
 
-// Replays the buffered parts captured during the SPS/PPS scan (so ffmpeg sees the
-// SPS+PPS+IDR sequence required to start decoding) then continues pumping live parts. We
-// honor backpressure: if ffmpeg falls behind (CPU spike, paused consumer, etc.), ignoring
-// drain would let Node's write buffer grow without bound. Awaiting drain throttles the
-// camera read loop instead — the camera's TCP receive window will fill up and the kernel
-// will pause it for us.
-async function pumpKasa(
-    kasa: KasaClient,
-    videoPipe: Writable,
-    audioPipe: Writable,
-    prebuffered: KasaPart[],
-): Promise<void> {
-    const writePart = async (part: KasaPart) => {
-        const pipe =
-            part.contentType === KasaMimeVideo ? videoPipe : part.contentType === KasaMimeG711U ? audioPipe : undefined;
-        if (!pipe || pipe.writableEnded || pipe.destroyed) return;
-        if (!pipe.write(part.body)) {
-            // Race 'drain' against teardown. If the pipe closes/errors before draining,
-            // 'drain' never fires and the pump would hang forever. AbortController removes
-            // the losing listeners after the race so frequent backpressure cycles don't
-            // accumulate listeners on the pipe.
-            const ac = new AbortController();
-            try {
-                await Promise.race([
-                    once(pipe, 'drain', { signal: ac.signal }).catch(() => {}),
-                    once(pipe, 'close', { signal: ac.signal }).catch(() => {}),
-                    once(pipe, 'error', { signal: ac.signal }).catch(() => {}),
-                ]);
-            } finally {
-                ac.abort();
-            }
-        }
-    };
+// Reserve a TCP port on localhost for the RTSP server. Brief TOCTOU window between close
+// and re-bind is accepted — nothing else snatches loopback ports in those few ms.
+async function reserveTcpPort(): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+        const probe = net.createServer();
+        probe.once('error', reject);
+        probe.listen(0, '127.0.0.1', () => {
+            const port = (probe.address() as net.AddressInfo).port;
+            probe.close(() => resolve(port));
+        });
+    });
+}
 
-    try {
-        for (const part of prebuffered) await writePart(part);
-        // Release prebuffered parts (up to a few hundred KB each) — they were captured
-        // during the SPS/PPS scan and are only needed for this single replay.
-        prebuffered.length = 0;
-        while (true) {
-            const part = await kasa.readPart();
-            await writePart(part);
-        }
-    } finally {
-        try {
-            videoPipe.end();
-        } catch {}
-        try {
-            audioPipe.end();
-        } catch {}
-    }
+// Compute an RTP timestamp at `clockHz` from a process.hrtime delta in nanoseconds.
+// 32-bit unsigned wrap is the RTP norm — receivers handle wrap.
+function nanosToRtp(deltaNs: bigint, clockHz: number): number {
+    // BigInt multiply keeps precision for clockHz=90000 over hours of streaming.
+    const ticks = (deltaNs * BigInt(clockHz)) / 1_000_000_000n;
+    return Number(ticks & 0xffffffffn) >>> 0;
 }
 
 // Orchestrates the kasa→consumer streaming pipeline:
-//   kasa multipart → ffmpeg pipe inputs (codec copy) → RTP UDP outputs
-//                  → minimal RTSP server forwards UDP RTP as TCP-interleaved frames
-//                  → consumer reads via rtsp:// URL
+//   kasa multipart → native RTP packetizer → RTSP TCP-interleaved frames → consumer
 //
-// Returns a handle whose `kill()` tears down everything (kasa, ffmpeg, UDP sockets, TCP
-// server, active client) and whose `exited` promise resolves once that teardown is done.
+// No ffmpeg subprocess, no UDP loopback hop, no extra forwarder layer. The kasa parts
+// already carry the codecs we serve (annex-b H.264, G.711 µ-law); ffmpeg's only job in
+// the previous design was RTP packetization, which is well-defined enough to do directly.
+//
+// Returns a handle whose `kill()` tears down everything (kasa, TCP server, active
+// client) and whose `exited` promise resolves once that teardown is done.
 export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStreamHandle> {
-    const { kasa, ffmpegPath, console, cachedSps, cachedPps, onFreshSpsPps } = opts;
+    const { kasa, console, cachedSps, cachedPps, onFreshSpsPps } = opts;
 
     // Fast path: caller supplied cached SPS/PPS from a previous session. Skip the scan and
     // start streaming live parts immediately — saves the ~1-2s preScanSpsPps wait on cold
@@ -263,8 +156,6 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
         (cachedSps[0] & 0x1f) === 7 &&
         (cachedPps[0] & 0x1f) === 8;
     if ((cachedSps || cachedPps) && !cacheValid) {
-        // Caller will overwrite the bad cache via onFreshSpsPps below once the slow path
-        // produces fresh values; nothing to do here beyond logging and falling through.
         console.warn('[kasa-stream] cached SPS/PPS failed validation; falling back to in-band scan');
     }
 
@@ -280,8 +171,6 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
         sps = scanned.sps;
         pps = scanned.pps;
         buffered = scanned.buffered;
-        // Persist for next time. Pass the original error object (not just .message) so
-        // stack/context survive — non-Error throws would lose everything otherwise.
         try {
             onFreshSpsPps?.(sps, pps);
         } catch (e) {
@@ -290,128 +179,11 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     }
     const sdp = buildSdp(sps, pps);
 
-    const videoUdp = await bindUdpPair();
-    const audioUdp = await bindUdpPair();
+    // Packetizers carry seq + SSRC across the whole session.
+    const h264 = new H264RtpPacketizer();
+    const g711 = new G711RtpPacketizer();
 
-    // Two RTP outputs, one per track. `-vn`/`-an` per output filter the unwanted side
-    // rather than using `-map`. Explicit -payload_type lines pin the PTs to the values our
-    // SDP advertises (96 for H.264, 0 for PCMU) so a future ffmpeg default change can't
-    // silently break the SDP/stream contract.
-    // prettier-ignore
-    const args = [
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-thread_queue_size', '1024',
-        '-f', 'h264',
-        '-i', 'pipe:3',
-        '-thread_queue_size', '1024',
-        '-f', 'mulaw',
-        '-ar', '8000',
-        '-ac', '1',
-        '-i', 'pipe:4',
-        '-vcodec', 'copy', '-an', '-dn', '-sn',
-        '-f', 'rtp',
-        '-payload_type', '96',
-        `rtp://127.0.0.1:${videoUdp.rtp.port}?rtcpport=${videoUdp.rtcp.port}`,
-        '-acodec', 'copy', '-vn', '-dn', '-sn',
-        '-f', 'rtp',
-        '-payload_type', '0',
-        `rtp://127.0.0.1:${audioUdp.rtp.port}?rtcpport=${audioUdp.rtcp.port}`,
-    ];
-
-    const cp = child_process.spawn(ffmpegPath, args, {
-        stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
-    });
-    cp.stderr?.on('data', d => {
-        const text = d.toString().trim();
-        if (text) console.log('[kasa-ffmpeg]', text);
-    });
-
-    const videoPipe = cp.stdio[3] as Writable;
-    const audioPipe = cp.stdio[4] as Writable;
-
-    // Attach 'error' listeners on both pipes IMMEDIATELY. When cleanupAll calls cp.kill,
-    // ffmpeg's stdio FDs close forcibly and any in-flight pump write throws ECONNRESET /
-    // EPIPE on the writable side. Without listeners, Node turns those into
-    // uncaughtException and crashes the whole plugin worker (taking down every camera).
-    // The `_e` arg is intentional — we just want the stream to be informed there's a
-    // listener.
-    videoPipe.on('error', _e => {
-        /* tear down via the kasa pump's own try/finally */
-    });
-    audioPipe.on('error', _e => {
-        /* tear down via the kasa pump's own try/finally */
-    });
-
-    let resolveExited!: () => void;
-    const exited = new Promise<void>(r => {
-        resolveExited = r;
-    });
-
-    // Forward-declare anything cleanupAll touches that's initialized later in the function.
-    // ffmpeg's `exit`/`error` events or a pump throw can fire cleanupAll while we're still
-    // awaiting `reserveTcpPort()` below — referencing TDZ const bindings here would throw
-    // an uncaught ReferenceError and skip the rest of teardown. Explicit `= undefined` so
-    // eslint's prefer-const sees the later reassignment.
-    let tcpServer: net.Server | undefined = undefined;
-    let activeClient: net.Socket | undefined = undefined;
-    let unregisterCleanup: (() => void) | undefined = undefined;
-
-    let killed = false;
-    const cleanupAll = () => {
-        if (killed) return;
-        killed = true;
-        try {
-            unregisterCleanup?.();
-        } catch {}
-        try {
-            tcpServer?.close();
-        } catch {}
-        try {
-            activeClient?.destroy();
-        } catch {}
-        try {
-            kasa.destroy();
-        } catch {}
-        try {
-            cp.kill('SIGKILL');
-        } catch {}
-        try {
-            videoUdp.rtp.socket.close();
-        } catch {}
-        try {
-            videoUdp.rtcp.socket.close();
-        } catch {}
-        try {
-            audioUdp.rtp.socket.close();
-        } catch {}
-        try {
-            audioUdp.rtcp.socket.close();
-        } catch {}
-        resolveExited();
-    };
-    // Register with the process-level cleanup registry so worker termination kills the
-    // ffmpeg subprocess + closes the kasa connection even if our normal teardown path
-    // (release(), kill switch, ffmpeg exit) didn't run.
-    unregisterCleanup = registerLiveCleanup(cleanupAll);
-
-    // ffmpeg exit (or spawn error) is itself a teardown trigger.
-    cp.once('exit', cleanupAll);
-    cp.once('error', cleanupAll);
-
-    // Pump kasa → ffmpeg pipes. If the pump throws (kasa stream ended/errored), tear down.
-    // We suppress the warn when `killed` is already set, because that means our own
-    // cleanupAll destroyed the kasa connection and the resulting "stream ended" throw is
-    // expected close-sequence noise, not a real error.
-    pumpKasa(kasa, videoPipe, audioPipe, buffered)
-        .catch(e => {
-            if (!killed) console.warn('[kasa-stream] pump error', (e as Error).message);
-        })
-        .finally(cleanupAll);
-
-    // Forwarding state — populated atomically when the RTSP client PLAYs, used by the
-    // always-attached UDP message handlers below. One reference instead of two so the
-    // handlers can't observe a half-set state under any scheduling.
+    // Active forwarder — populated when the RTSP client PLAYs, cleared on teardown.
     interface ActiveForwarder {
         send: (channel: number, packet: Buffer) => boolean;
         videoRtp: number;
@@ -421,22 +193,91 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     }
     let active: ActiveForwarder | null = null;
 
-    // Attach UDP listeners IMMEDIATELY (not on PLAY) so the kernel buffer gets drained as
-    // soon as ffmpeg starts producing packets. Without this, packets sent before the RTSP
-    // client connects pile up in SO_RCVBUF and either get dropped on overflow, or block
-    // libuv from polling the socket cleanly. Until `active` is set, we just discard.
-    videoUdp.rtp.socket.on('message', msg => {
-        if (active) active.send(active.videoRtp, msg);
+    let tcpServer: net.Server | undefined = undefined;
+    let activeClient: net.Socket | undefined = undefined;
+    let unregisterCleanup: (() => void) | undefined = undefined;
+    let rtcpInterval: NodeJS.Timeout | undefined = undefined;
+
+    let resolveExited!: () => void;
+    const exited = new Promise<void>(r => {
+        resolveExited = r;
     });
-    videoUdp.rtcp.socket.on('message', msg => {
-        if (active) active.send(active.videoRtcp, msg);
-    });
-    audioUdp.rtp.socket.on('message', msg => {
-        if (active) active.send(active.audioRtp, msg);
-    });
-    audioUdp.rtcp.socket.on('message', msg => {
-        if (active) active.send(active.audioRtcp, msg);
-    });
+
+    let killed = false;
+    const cleanupAll = () => {
+        if (killed) return;
+        killed = true;
+        try {
+            unregisterCleanup?.();
+        } catch {}
+        if (rtcpInterval) {
+            clearInterval(rtcpInterval);
+            rtcpInterval = undefined;
+        }
+        try {
+            tcpServer?.close();
+        } catch {}
+        try {
+            activeClient?.destroy();
+        } catch {}
+        try {
+            kasa.destroy();
+        } catch {}
+        active = null;
+        resolveExited();
+    };
+    unregisterCleanup = registerLiveCleanup(cleanupAll);
+
+    // Pump kasa parts directly into the active forwarder. No intermediate process, pipe,
+    // or UDP hop. Drops parts until the RTSP client PLAYs (i.e. while `active` is null —
+    // start-up race only; we don't implement PAUSE semantics, since live consumers
+    // either keep playing or TEARDOWN). Backpressure: handled inside rtsp.ts `send` —
+    // drops while Node's userland write queue is full and tears down the client if the
+    // queued bytes cross a hard cap. From here we just call send and let it decide.
+    const pump = async () => {
+        const t0 = process.hrtime.bigint();
+        const replay = buffered;
+        buffered = [];
+        // Audio RTP timestamps must advance by sample count, not wall-clock — RTP
+        // receivers use the timestamp to drive playout, and any wall-clock-derived jitter
+        // would surface as audible discontinuities. Initialize once on first audio part
+        // (using elapsed time so audio and video share a roughly aligned origin), then
+        // chain via the packetizer's return value across every subsequent part.
+        let audioTs: number | undefined;
+        const handlePart = (part: KasaPart) => {
+            if (killed) return;
+            if (!active) return;
+            const fwd = active;
+            const elapsed = process.hrtime.bigint() - t0;
+            if (part.contentType === KasaMimeVideo) {
+                const ts = nanosToRtp(elapsed, H264_CLOCK_HZ);
+                h264.packetize(part.body, ts, pkt => {
+                    if (active === fwd) fwd.send(fwd.videoRtp, pkt);
+                });
+            } else if (part.contentType === KasaMimeG711U) {
+                if (audioTs === undefined) audioTs = nanosToRtp(elapsed, G711_CLOCK_HZ);
+                audioTs = g711.packetize(part.body, audioTs, pkt => {
+                    if (active === fwd) fwd.send(fwd.audioRtp, pkt);
+                });
+            }
+        };
+
+        try {
+            for (const part of replay) handlePart(part);
+            // Release prebuffered parts (up to a few hundred KB each) — they were captured
+            // during the SPS/PPS scan and are only needed for this single replay.
+            replay.length = 0;
+            while (!killed) {
+                const part = await kasa.readPart();
+                handlePart(part);
+            }
+        } catch (e) {
+            if (!killed) console.warn('[kasa-stream] pump error', (e as Error).message);
+        } finally {
+            cleanupAll();
+        }
+    };
+    void pump();
 
     // Bind the RTSP listener last, after all the supporting pieces are in place.
     const rtspPort = await reserveTcpPort();
@@ -472,15 +313,27 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
                     audioRtp: channels.audio.rtp,
                     audioRtcp: channels.audio.rtcp,
                 };
+                // Periodic RTCP Sender Reports. Receivers map each track's RTP timeline
+                // to wall-clock NTP via SRs to keep audio/video in sync — the prior ffmpeg
+                // pipeline emitted them, so generating a minimal SR every 5 s keeps
+                // behavior parity. A single SR per track is ~28 B; cost is negligible.
+                rtcpInterval = setInterval(() => {
+                    if (!active || killed) return;
+                    const ntp = nowNtp();
+                    const vsr = h264.senderReport(ntp);
+                    if (vsr) active.send(active.videoRtcp, vsr);
+                    const asr = g711.senderReport(ntp);
+                    if (asr) active.send(active.audioRtcp, asr);
+                }, 5000);
             },
             onTeardown: cleanupAll,
         });
     });
 
     await new Promise<void>((resolve, reject) => {
-        tcpServer.once('error', reject);
-        tcpServer.listen(rtspPort, '127.0.0.1', () => {
-            tcpServer.removeListener('error', reject);
+        tcpServer!.once('error', reject);
+        tcpServer!.listen(rtspPort, '127.0.0.1', () => {
+            tcpServer!.removeListener('error', reject);
             resolve();
         });
     });

@@ -35,6 +35,15 @@ interface RtspRequest {
 // TCP-interleaved transport only — that's what Scrypted's pipeline asks for by default and
 // it sidesteps every NAT/UDP-loss complication. We build the SDP upstream and just serve it
 // on DESCRIBE; we never parse one.
+// Hard cap on Node's userland write queue (`socket.bufferSize`). If the consumer falls
+// behind by more than this, we give up rather than letting RAM grow unbounded. 2 MB at
+// 4 Mbps video is ~4 s of data — past that, the stream is unrecoverable for live
+// consumption anyway, and most receivers would resync faster from a fresh PLAY than
+// from catching up to a stale backlog. Note: this is Node's queue, not the kernel TCP
+// send buffer (SO_SNDBUF) — the kernel buffer is bounded by net.ipv4.tcp_wmem and
+// applies backpressure via TCP window before this cap would ever be hit.
+const RTSP_WRITE_BUFFER_HARD_CAP = 2 * 1024 * 1024;
+
 export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): void {
     const sessionId = randomBytes(8).toString('hex');
     let videoChannels: RtspChannelPair | undefined;
@@ -42,6 +51,13 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     let buffered: Buffer = Buffer.alloc(0);
     let isPlaying = false;
     let teardownNotified = false;
+    // Drop sends while Node's userland write queue is back-pressured (client.write()
+    // returned false). Cleared on 'drain'. Without this, a slow consumer makes the queue
+    // grow unbounded — the live-video equivalent of bufferbloat.
+    let backpressured = false;
+    client.on('drain', () => {
+        backpressured = false;
+    });
 
     const notifyTeardown = () => {
         if (teardownNotified) return;
@@ -51,6 +67,22 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
 
     const send: RtspSendInterleaved = (channel, packet) => {
         if (client.destroyed) return false;
+        // Cap check runs BEFORE the backpressured early-return: a single write that
+        // pushes bufferSize over the cap will set backpressured=true on the way out, and
+        // without the cap check up here the next send would short-circuit on the
+        // backpressure flag and never observe the oversize backlog. With the cap check
+        // first, a permanently stuck consumer (paused but not closed) gets torn down on
+        // the next send instead of holding bytes resident forever.
+        if (client.bufferSize > RTSP_WRITE_BUFFER_HARD_CAP) {
+            opts.console.warn(
+                'rtsp: client write buffer exceeded',
+                RTSP_WRITE_BUFFER_HARD_CAP,
+                'bytes — destroying client',
+            );
+            client.destroy();
+            return false;
+        }
+        if (backpressured) return false;
         // Interleaved frame: '$' + 1-byte channel + 2-byte BE length + RTP packet bytes.
         // Header + body in one Buffer to avoid splitting writes (a small write between the
         // two would let an out-of-order chunk arrive in the middle of an interleaved frame).
@@ -64,7 +96,9 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
         // ERR_STREAM_DESTROYED. Catch it; the next packet's destroyed check will gate
         // further sends.
         try {
-            return client.write(out);
+            const ok = client.write(out);
+            if (!ok) backpressured = true;
+            return ok;
         } catch {
             return false;
         }
