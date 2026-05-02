@@ -421,8 +421,8 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
             password,
         });
 
-        // Single shared kill switch: any teardown source (kasa close, ffmpeg exit, RTSP
-        // client disconnect, pump error) resolves it, and every owned resource registers a
+        // Single shared kill switch: any teardown source (kasa close, RTSP client
+        // disconnect, pump error) resolves it, and every owned resource registers a
         // cleanup against it. spawnKasaStream owns the actual resource teardown; we just
         // surface the kill switch to settings-change handlers via activeStreamKills.
         const kill = new Deferred<void>();
@@ -431,7 +431,6 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         kasa.body.on('close', () => kill.resolve());
         kasa.body.on('error', () => kill.resolve());
 
-        const ffmpegPath = await mediaManager.getFFmpegPath();
         // Read cached SPS/PPS from per-device storage. Lets spawnKasaStream skip the
         // ~1-2s preScanSpsPps wait on cold starts (HomeKit's perceived latency dominates
         // here). Cache survives plugin restarts. Stale-cache risk is bounded — in-band
@@ -446,7 +445,6 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         try {
             stream = await spawnKasaStream({
                 kasa,
-                ffmpegPath,
                 console: this.console,
                 cachedSps,
                 cachedPps,
@@ -610,8 +608,8 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
     // and kasa HTTPS sockets running after the plugin is gone, since child_process is
     // owned by the host Node process, not the worker.
     release(): void {
-        // Each kill triggers cleanupAll inside spawnKasaStream — kills ffmpeg, destroys
-        // the kasa connection, closes UDP sockets and the local RTSP server.
+        // Each kill triggers cleanupAll inside spawnKasaStream — destroys the kasa
+        // connection and closes the local RTSP server.
         for (const kill of [...this.activeStreamKills]) kill.resolve();
         // Stop the intercom too if anything was active. stopIntercom is async only because
         // its signature is — the work it does is synchronous, so fire-and-forget is fine.
