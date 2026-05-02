@@ -174,13 +174,16 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 continue;
             }
             const headerEndIdx = buffered.indexOf(HEADER_TERMINATOR);
-            if (headerEndIdx < 0) {
-                if (buffered.length > RTSP_MAX_HEADER_BYTES) {
-                    opts.console.warn('rtsp: header section exceeded cap, dropping client');
-                    client.destroy();
-                }
+            // Apply the cap whether or not the terminator has arrived: a single oversized
+            // chunk that contains the terminator would otherwise slip past a check that
+            // only fires while we're still waiting for it.
+            const headerLen = headerEndIdx < 0 ? buffered.length : headerEndIdx;
+            if (headerLen > RTSP_MAX_HEADER_BYTES) {
+                opts.console.warn('rtsp: header section exceeded cap, dropping client');
+                client.destroy();
                 return;
             }
+            if (headerEndIdx < 0) return;
             const headerStr = buffered.subarray(0, headerEndIdx).toString('utf8');
             const headerLines = headerStr.split('\r\n');
             const requestLine = headerLines.shift() || '';
@@ -194,9 +197,18 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 if (colon < 0) continue;
                 headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
             }
-            const contentLength = parseInt(headers.get('content-length') || '0', 10);
-            if (!Number.isFinite(contentLength) || contentLength < 0 || contentLength > RTSP_MAX_BODY_BYTES) {
-                opts.console.warn('rtsp: invalid or oversized content-length', headers.get('content-length'));
+            // Strict validation: parseInt('1abc', 10) === 1, which would let us buffer
+            // 1 body byte and then desync the parser on the rest. Require a pure decimal
+            // string before trusting the length.
+            const rawContentLength = headers.get('content-length');
+            if (rawContentLength !== undefined && !/^\d+$/.test(rawContentLength)) {
+                opts.console.warn('rtsp: invalid content-length', rawContentLength);
+                client.destroy();
+                return;
+            }
+            const contentLength = rawContentLength ? parseInt(rawContentLength, 10) : 0;
+            if (contentLength > RTSP_MAX_BODY_BYTES) {
+                opts.console.warn('rtsp: oversized content-length', rawContentLength);
                 client.destroy();
                 return;
             }
