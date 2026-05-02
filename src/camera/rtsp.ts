@@ -67,7 +67,12 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
 
     const send: RtspSendInterleaved = (channel, packet) => {
         if (client.destroyed) return false;
-        if (backpressured) return false;
+        // Cap check runs BEFORE the backpressured early-return: a single write that
+        // pushes bufferSize over the cap will set backpressured=true on the way out, and
+        // without the cap check up here the next send would short-circuit on the
+        // backpressure flag and never observe the oversize backlog. With the cap check
+        // first, a permanently stuck consumer (paused but not closed) gets torn down on
+        // the next send instead of holding bytes resident forever.
         if (client.bufferSize > RTSP_WRITE_BUFFER_HARD_CAP) {
             opts.console.warn(
                 'rtsp: client write buffer exceeded',
@@ -77,6 +82,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
             client.destroy();
             return false;
         }
+        if (backpressured) return false;
         // Interleaved frame: '$' + 1-byte channel + 2-byte BE length + RTP packet bytes.
         // Header + body in one Buffer to avoid splitting writes (a small write between the
         // two would let an out-of-order chunk arrive in the middle of an interleaved frame).
