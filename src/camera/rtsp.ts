@@ -27,7 +27,7 @@ export interface RtspHandlerOptions {
 interface RtspRequest {
     method: string;
     uri: string;
-    headers: Record<string, string>;
+    headers: Map<string, string>;
 }
 
 // Minimal RTSP server-side handler for ONE TCP client. Supports the methods Scrypted (and
@@ -85,7 +85,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     };
 
     const handleRequest = (req: RtspRequest) => {
-        const cseq = req.headers['cseq'] || '0';
+        const cseq = req.headers.get('cseq') || '0';
         switch (req.method) {
             case 'OPTIONS':
                 respond(cseq, 200, 'OK', {
@@ -98,7 +98,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 return;
 
             case 'SETUP': {
-                const transport = req.headers['transport'] || '';
+                const transport = req.headers.get('transport') || '';
                 const m = /interleaved=(\d+)-(\d+)/i.exec(transport);
                 if (!m) {
                     // We only support TCP-interleaved transport. UDP would require allocating
@@ -153,6 +153,12 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     };
 
     const HEADER_TERMINATOR = Buffer.from('\r\n\r\n');
+    // Caps on accumulated buffer size. Server is localhost-only, but a misbehaving or
+    // malicious client could trickle bytes without ever sending the header terminator,
+    // or advertise a giant Content-Length, forcing `buffered` to grow unbounded via
+    // Buffer.concat. Real RTSP requests for the methods we accept are well under 1 KB.
+    const RTSP_MAX_HEADER_BYTES = 8 * 1024;
+    const RTSP_MAX_BODY_BYTES = 4 * 1024;
     client.on('data', (chunk: Buffer) => {
         buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
         // Parse messages until we run out of complete ones in the buffer.
@@ -168,21 +174,44 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 continue;
             }
             const headerEndIdx = buffered.indexOf(HEADER_TERMINATOR);
+            // Apply the cap whether or not the terminator has arrived: a single oversized
+            // chunk that contains the terminator would otherwise slip past a check that
+            // only fires while we're still waiting for it.
+            const headerLen = headerEndIdx < 0 ? buffered.length : headerEndIdx;
+            if (headerLen > RTSP_MAX_HEADER_BYTES) {
+                opts.console.warn('rtsp: header section exceeded cap, dropping client');
+                client.destroy();
+                return;
+            }
             if (headerEndIdx < 0) return;
             const headerStr = buffered.subarray(0, headerEndIdx).toString('utf8');
             const headerLines = headerStr.split('\r\n');
             const requestLine = headerLines.shift() || '';
             const [method, uri] = requestLine.split(' ');
-            // Null-prototype map so a malicious peer can't reach Object.prototype via a
-            // crafted header name like `__proto__`. Practical risk is tiny — the server
-            // only listens on localhost — but the fix is one line and shuts up CodeQL.
-            const headers = Object.create(null) as Record<string, string>;
+            // Map (not a plain object) so a malicious peer can't reach Object.prototype via
+            // a crafted header name like `__proto__`. Practical risk is tiny — the server
+            // only listens on localhost — but Map is the pattern CodeQL accepts.
+            const headers = new Map<string, string>();
             for (const line of headerLines) {
                 const colon = line.indexOf(':');
                 if (colon < 0) continue;
-                headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+                headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
             }
-            const contentLength = parseInt(headers['content-length'] || '0', 10);
+            // Strict validation: parseInt('1abc', 10) === 1, which would let us buffer
+            // 1 body byte and then desync the parser on the rest. Require a pure decimal
+            // string before trusting the length.
+            const rawContentLength = headers.get('content-length');
+            if (rawContentLength !== undefined && !/^\d+$/.test(rawContentLength)) {
+                opts.console.warn('rtsp: invalid content-length', rawContentLength);
+                client.destroy();
+                return;
+            }
+            const contentLength = rawContentLength ? parseInt(rawContentLength, 10) : 0;
+            if (contentLength > RTSP_MAX_BODY_BYTES) {
+                opts.console.warn('rtsp: oversized content-length', rawContentLength);
+                client.destroy();
+                return;
+            }
             const totalLen = headerEndIdx + HEADER_TERMINATOR.length + contentLength;
             if (buffered.length < totalLen) return;
             // We currently ignore request bodies — none of the methods we handle need one.
