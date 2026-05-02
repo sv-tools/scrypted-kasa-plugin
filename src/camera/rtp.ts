@@ -13,6 +13,52 @@ export const PT_PCMU = 0;
 export const H264_CLOCK_HZ = 90000;
 export const G711_CLOCK_HZ = 8000;
 
+// RTCP Sender Report: 28 bytes, no report blocks (RC=0). RFC 3550 § 6.4.1.
+const RTCP_SR_LEN = 28;
+const RTCP_PT_SR = 200;
+// NTP epoch (1900-01-01) precedes Unix epoch (1970-01-01) by this many seconds.
+const NTP_UNIX_EPOCH_OFFSET_S = 2208988800;
+
+export interface NtpTime {
+    seconds: number;
+    fraction: number;
+}
+
+// Wall-clock as an NTP 64-bit fixed-point timestamp (32-bit seconds since 1900,
+// 32-bit fraction-of-second). Used in RTCP Sender Reports so receivers can map
+// each track's RTP timeline back to a common wall-clock — required for A/V sync
+// across two RTP streams that have independent random initial timestamps.
+export function nowNtp(): NtpTime {
+    const ms = Date.now();
+    const seconds = Math.floor(ms / 1000) + NTP_UNIX_EPOCH_OFFSET_S;
+    // 2^32 / 1000 = 4294967.296 — multiply ms-fraction by that to get the 32-bit
+    // fraction word. Math.round to bias toward the nearest tick.
+    const fraction = Math.round(((ms % 1000) / 1000) * 0x1_0000_0000);
+    return { seconds: seconds >>> 0, fraction: fraction >>> 0 };
+}
+
+function writeSenderReport(
+    ssrc: number,
+    ntp: NtpTime,
+    rtpTimestamp: number,
+    packetCount: number,
+    octetCount: number,
+): Buffer {
+    const buf = Buffer.allocUnsafe(RTCP_SR_LEN);
+    // V=2, P=0, RC=0 → 0b10_0_00000 = 0x80
+    buf[0] = RTP_VERSION << 6;
+    buf[1] = RTCP_PT_SR;
+    // Length in 32-bit words minus 1 → (28/4) - 1 = 6.
+    buf.writeUInt16BE(6, 2);
+    buf.writeUInt32BE(ssrc >>> 0, 4);
+    buf.writeUInt32BE(ntp.seconds >>> 0, 8);
+    buf.writeUInt32BE(ntp.fraction >>> 0, 12);
+    buf.writeUInt32BE(rtpTimestamp >>> 0, 16);
+    buf.writeUInt32BE(packetCount >>> 0, 20);
+    buf.writeUInt32BE(octetCount >>> 0, 24);
+    return buf;
+}
+
 // FU-A fragmentation cutoff. We serve via RTSP/TCP-interleaved (no MTU constraint),
 // but H.264 RTP receivers expect large NAL units to come as FU-A — fragmenting matches
 // the wire shape they would see from any standard RTSP server. 1400 keeps headroom
@@ -83,6 +129,9 @@ export type RtpSink = (packet: Buffer) => void;
 // to be stable across all packets of a stream, with seq monotonically increasing.
 export class H264RtpPacketizer {
     private seq: number;
+    private packetCount = 0;
+    private octetCount = 0;
+    private lastTimestamp = 0;
     readonly ssrc: number;
 
     constructor() {
@@ -107,6 +156,8 @@ export class H264RtpPacketizer {
                 writeRtpHeader(pkt, PT_H264, this.seq++, timestamp, this.ssrc, isLastNal);
                 nal.copy(pkt, RTP_HEADER_LEN);
                 sink(pkt);
+                this.packetCount++;
+                this.octetCount = (this.octetCount + nal.length) >>> 0;
                 continue;
             }
 
@@ -132,9 +183,21 @@ export class H264RtpPacketizer {
                 pkt[RTP_HEADER_LEN + 1] = fuHeader;
                 payload.copy(pkt, RTP_HEADER_LEN + FU_A_HEADER_OVERHEAD, offset, offset + take);
                 sink(pkt);
+                this.packetCount++;
+                this.octetCount = (this.octetCount + FU_A_HEADER_OVERHEAD + take) >>> 0;
                 offset += take;
             }
         }
+        this.lastTimestamp = timestamp >>> 0;
+    }
+
+    // Build an RTCP Sender Report describing the latest emission. `ntp` should be sampled
+    // close to the moment of the SR's wire emission so the NTP↔RTP timestamp pair stays
+    // accurate. Returns undefined when no packets have been emitted yet — receivers can
+    // tolerate a missing first SR, and emitting one with all zeros confuses jitter math.
+    senderReport(ntp: NtpTime): Buffer | undefined {
+        if (this.packetCount === 0) return;
+        return writeSenderReport(this.ssrc, ntp, this.lastTimestamp, this.packetCount, this.octetCount);
     }
 }
 
@@ -145,6 +208,9 @@ export class H264RtpPacketizer {
 // caller can chain across parts if it wants sample-accurate timing.
 export class G711RtpPacketizer {
     private seq: number;
+    private packetCount = 0;
+    private octetCount = 0;
+    private lastTimestamp = 0;
     readonly ssrc: number;
 
     constructor() {
@@ -161,9 +227,17 @@ export class G711RtpPacketizer {
             writeRtpHeader(pkt, PT_PCMU, this.seq++, ts, this.ssrc, false);
             mulaw.copy(pkt, RTP_HEADER_LEN, offset, offset + take);
             sink(pkt);
+            this.packetCount++;
+            this.octetCount = (this.octetCount + take) >>> 0;
+            this.lastTimestamp = ts;
             ts = (ts + take) >>> 0;
             offset += take;
         }
         return ts;
+    }
+
+    senderReport(ntp: NtpTime): Buffer | undefined {
+        if (this.packetCount === 0) return;
+        return writeSenderReport(this.ssrc, ntp, this.lastTimestamp, this.packetCount, this.octetCount);
     }
 }

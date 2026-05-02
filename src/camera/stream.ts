@@ -1,6 +1,6 @@
 import net from 'net';
 import { findSpsPps, KasaClient, KasaMimeG711U, KasaMimeVideo, KasaPart } from './api';
-import { G711_CLOCK_HZ, G711RtpPacketizer, H264_CLOCK_HZ, H264RtpPacketizer } from './rtp';
+import { G711_CLOCK_HZ, G711RtpPacketizer, H264_CLOCK_HZ, H264RtpPacketizer, nowNtp } from './rtp';
 import { handleRtspClient } from './rtsp';
 
 // Process-level cleanup registry. Scrypted runs plugins as worker threads; resources
@@ -187,13 +187,16 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     interface ActiveForwarder {
         send: (channel: number, packet: Buffer) => boolean;
         videoRtp: number;
+        videoRtcp: number;
         audioRtp: number;
+        audioRtcp: number;
     }
     let active: ActiveForwarder | null = null;
 
     let tcpServer: net.Server | undefined = undefined;
     let activeClient: net.Socket | undefined = undefined;
     let unregisterCleanup: (() => void) | undefined = undefined;
+    let rtcpInterval: NodeJS.Timeout | undefined = undefined;
 
     let resolveExited!: () => void;
     const exited = new Promise<void>(r => {
@@ -207,6 +210,10 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
         try {
             unregisterCleanup?.();
         } catch {}
+        if (rtcpInterval) {
+            clearInterval(rtcpInterval);
+            rtcpInterval = undefined;
+        }
         try {
             tcpServer?.close();
         } catch {}
@@ -223,14 +230,19 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
 
     // Pump kasa parts directly into the active forwarder. No intermediate process, pipe,
     // or UDP hop. Drops parts when no client is attached (start-up race or paused stream).
-    // Backpressure: client.write() returns false on TCP backpressure but we don't await
-    // drain — for live video, blocking the read loop on a slow consumer would just grow
-    // latency. If a consumer can't keep up the stream will visibly stutter, which is the
-    // right failure mode (vs. ballooning RAM or stalling other cameras).
+    // Backpressure: handled inside rtsp.ts `send` — drops while the socket is full and
+    // tears down the client if the kernel buffer crosses a hard cap. From here we just
+    // call send and let it decide.
     const pump = async () => {
         const t0 = process.hrtime.bigint();
         const replay = buffered;
         buffered = [];
+        // Audio RTP timestamps must advance by sample count, not wall-clock — RTP
+        // receivers use the timestamp to drive playout, and any wall-clock-derived jitter
+        // would surface as audible discontinuities. Initialize once on first audio part
+        // (using elapsed time so audio and video share a roughly aligned origin), then
+        // chain via the packetizer's return value across every subsequent part.
+        let audioTs: number | undefined;
         const handlePart = (part: KasaPart) => {
             if (killed) return;
             if (!active) return;
@@ -242,8 +254,8 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
                     if (active === fwd) fwd.send(fwd.videoRtp, pkt);
                 });
             } else if (part.contentType === KasaMimeG711U) {
-                const ts = nanosToRtp(elapsed, G711_CLOCK_HZ);
-                g711.packetize(part.body, ts, pkt => {
+                if (audioTs === undefined) audioTs = nanosToRtp(elapsed, G711_CLOCK_HZ);
+                audioTs = g711.packetize(part.body, audioTs, pkt => {
                     if (active === fwd) fwd.send(fwd.audioRtp, pkt);
                 });
             }
@@ -296,8 +308,22 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
                 active = {
                     send,
                     videoRtp: channels.video.rtp,
+                    videoRtcp: channels.video.rtcp,
                     audioRtp: channels.audio.rtp,
+                    audioRtcp: channels.audio.rtcp,
                 };
+                // Periodic RTCP Sender Reports. Receivers map each track's RTP timeline
+                // to wall-clock NTP via SRs to keep audio/video in sync — the prior ffmpeg
+                // pipeline emitted them, so generating a minimal SR every 5 s keeps
+                // behavior parity. A single SR per track is ~28 B; cost is negligible.
+                rtcpInterval = setInterval(() => {
+                    if (!active || killed) return;
+                    const ntp = nowNtp();
+                    const vsr = h264.senderReport(ntp);
+                    if (vsr) active.send(active.videoRtcp, vsr);
+                    const asr = g711.senderReport(ntp);
+                    if (asr) active.send(active.audioRtcp, asr);
+                }, 5000);
             },
             onTeardown: cleanupAll,
         });

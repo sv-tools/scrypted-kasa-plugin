@@ -35,6 +35,12 @@ interface RtspRequest {
 // TCP-interleaved transport only — that's what Scrypted's pipeline asks for by default and
 // it sidesteps every NAT/UDP-loss complication. We build the SDP upstream and just serve it
 // on DESCRIBE; we never parse one.
+// Hard cap on socket write buffer. If the consumer falls behind by more than this, we
+// give up rather than letting RAM grow unbounded. 2 MB at 4 Mbps video is ~4 s of data —
+// past that, the stream is unrecoverable for live consumption anyway, and most receivers
+// would resync faster from a fresh PLAY than from catching up to a stale backlog.
+const RTSP_WRITE_BUFFER_HARD_CAP = 2 * 1024 * 1024;
+
 export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): void {
     const sessionId = randomBytes(8).toString('hex');
     let videoChannels: RtspChannelPair | undefined;
@@ -42,6 +48,13 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     let buffered: Buffer = Buffer.alloc(0);
     let isPlaying = false;
     let teardownNotified = false;
+    // Drop sends while the kernel-side write buffer is full. Cleared on 'drain'.
+    // Without this, a paused / slow consumer makes Node's internal write queue grow
+    // unbounded — the live-video equivalent of bufferbloat.
+    let backpressured = false;
+    client.on('drain', () => {
+        backpressured = false;
+    });
 
     const notifyTeardown = () => {
         if (teardownNotified) return;
@@ -51,6 +64,16 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
 
     const send: RtspSendInterleaved = (channel, packet) => {
         if (client.destroyed) return false;
+        if (backpressured) return false;
+        if (client.bufferSize > RTSP_WRITE_BUFFER_HARD_CAP) {
+            opts.console.warn(
+                'rtsp: client write buffer exceeded',
+                RTSP_WRITE_BUFFER_HARD_CAP,
+                'bytes — destroying client',
+            );
+            client.destroy();
+            return false;
+        }
         // Interleaved frame: '$' + 1-byte channel + 2-byte BE length + RTP packet bytes.
         // Header + body in one Buffer to avoid splitting writes (a small write between the
         // two would let an out-of-order chunk arrive in the middle of an interleaved frame).
@@ -64,7 +87,9 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
         // ERR_STREAM_DESTROYED. Catch it; the next packet's destroyed check will gate
         // further sends.
         try {
-            return client.write(out);
+            const ok = client.write(out);
+            if (!ok) backpressured = true;
+            return ok;
         } catch {
             return false;
         }
