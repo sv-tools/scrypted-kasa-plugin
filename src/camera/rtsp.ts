@@ -27,7 +27,7 @@ export interface RtspHandlerOptions {
 interface RtspRequest {
     method: string;
     uri: string;
-    headers: Record<string, string>;
+    headers: Map<string, string>;
 }
 
 // Minimal RTSP server-side handler for ONE TCP client. Supports the methods Scrypted (and
@@ -85,7 +85,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     };
 
     const handleRequest = (req: RtspRequest) => {
-        const cseq = req.headers['cseq'] || '0';
+        const cseq = req.headers.get('cseq') || '0';
         switch (req.method) {
             case 'OPTIONS':
                 respond(cseq, 200, 'OK', {
@@ -98,7 +98,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
                 return;
 
             case 'SETUP': {
-                const transport = req.headers['transport'] || '';
+                const transport = req.headers.get('transport') || '';
                 const m = /interleaved=(\d+)-(\d+)/i.exec(transport);
                 if (!m) {
                     // We only support TCP-interleaved transport. UDP would require allocating
@@ -173,16 +173,16 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
             const headerLines = headerStr.split('\r\n');
             const requestLine = headerLines.shift() || '';
             const [method, uri] = requestLine.split(' ');
-            // Null-prototype map so a malicious peer can't reach Object.prototype via a
-            // crafted header name like `__proto__`. Practical risk is tiny — the server
-            // only listens on localhost — but the fix is one line and shuts up CodeQL.
-            const headers = Object.create(null) as Record<string, string>;
+            // Map (not a plain object) so a malicious peer can't reach Object.prototype via
+            // a crafted header name like `__proto__`. Practical risk is tiny — the server
+            // only listens on localhost — but Map is the pattern CodeQL accepts.
+            const headers = new Map<string, string>();
             for (const line of headerLines) {
                 const colon = line.indexOf(':');
                 if (colon < 0) continue;
-                headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+                headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
             }
-            const contentLength = parseInt(headers['content-length'] || '0', 10);
+            const contentLength = parseInt(headers.get('content-length') || '0', 10);
             const totalLen = headerEndIdx + HEADER_TERMINATOR.length + contentLength;
             if (buffered.length < totalLen) return;
             // We currently ignore request bodies — none of the methods we handle need one.
