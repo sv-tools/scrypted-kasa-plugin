@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { ClientRequest } from 'http';
 import https from 'https';
+import net from 'net';
 import { PassThrough } from 'stream';
 
 export const KASA_TALK_PORT = 18443;
@@ -81,11 +82,16 @@ export class KasaTalkSession {
         // audio part we write is small (~230 B) and fewer than the segment size, so Nagle
         // would coalesce parts waiting for an ACK or for the 200 ms deadline — adding
         // user-perceptible chunkiness on top of the inherent network round-trip. The talk
-        // session is a constant low-rate stream, exactly the workload Nagle hurts. `once`
-        // because ClientRequest only emits 'socket' a single time per request lifetime.
-        req.once('socket', socket => {
-            socket.setNoDelay(true);
-        });
+        // session is a constant low-rate stream, exactly the workload Nagle hurts.
+        //
+        // Cover both timings: the default https.Agent pools connections and may assign a
+        // pooled socket synchronously inside https.request(), in which case `'socket'`
+        // already fired by the time we get here and our once-listener would never run.
+        // Check `req.socket` immediately, and otherwise register a once-listener for the
+        // fresh-connection path.
+        const setSocketNoDelay = (socket: net.Socket) => socket.setNoDelay(true);
+        if (req.socket) setSocketNoDelay(req.socket as net.Socket);
+        else req.once('socket', setSocketNoDelay);
 
         req.on('error', e => {
             // Suppress when the close came first (deliberate teardown via close()): ending
