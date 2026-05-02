@@ -35,10 +35,13 @@ interface RtspRequest {
 // TCP-interleaved transport only — that's what Scrypted's pipeline asks for by default and
 // it sidesteps every NAT/UDP-loss complication. We build the SDP upstream and just serve it
 // on DESCRIBE; we never parse one.
-// Hard cap on socket write buffer. If the consumer falls behind by more than this, we
-// give up rather than letting RAM grow unbounded. 2 MB at 4 Mbps video is ~4 s of data —
-// past that, the stream is unrecoverable for live consumption anyway, and most receivers
-// would resync faster from a fresh PLAY than from catching up to a stale backlog.
+// Hard cap on Node's userland write queue (`socket.bufferSize`). If the consumer falls
+// behind by more than this, we give up rather than letting RAM grow unbounded. 2 MB at
+// 4 Mbps video is ~4 s of data — past that, the stream is unrecoverable for live
+// consumption anyway, and most receivers would resync faster from a fresh PLAY than
+// from catching up to a stale backlog. Note: this is Node's queue, not the kernel TCP
+// send buffer (SO_SNDBUF) — the kernel buffer is bounded by net.ipv4.tcp_wmem and
+// applies backpressure via TCP window before this cap would ever be hit.
 const RTSP_WRITE_BUFFER_HARD_CAP = 2 * 1024 * 1024;
 
 export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): void {
@@ -48,9 +51,9 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
     let buffered: Buffer = Buffer.alloc(0);
     let isPlaying = false;
     let teardownNotified = false;
-    // Drop sends while the kernel-side write buffer is full. Cleared on 'drain'.
-    // Without this, a paused / slow consumer makes Node's internal write queue grow
-    // unbounded — the live-video equivalent of bufferbloat.
+    // Drop sends while Node's userland write queue is back-pressured (client.write()
+    // returned false). Cleared on 'drain'. Without this, a slow consumer makes the queue
+    // grow unbounded — the live-video equivalent of bufferbloat.
     let backpressured = false;
     client.on('drain', () => {
         backpressured = false;

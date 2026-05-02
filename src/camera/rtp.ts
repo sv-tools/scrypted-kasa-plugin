@@ -32,8 +32,10 @@ export function nowNtp(): NtpTime {
     const ms = Date.now();
     const seconds = Math.floor(ms / 1000) + NTP_UNIX_EPOCH_OFFSET_S;
     // 2^32 / 1000 = 4294967.296 — multiply ms-fraction by that to get the 32-bit
-    // fraction word. Math.round to bias toward the nearest tick.
-    const fraction = Math.round(((ms % 1000) / 1000) * 0x1_0000_0000);
+    // fraction word. Math.floor (not round) so the result is always strictly less
+    // than 2^32; otherwise an unlucky float rounding to exactly 2^32 would wrap to
+    // 0 via `>>> 0` without carrying into `seconds`.
+    const fraction = Math.floor(((ms % 1000) / 1000) * 0x1_0000_0000);
     return { seconds: seconds >>> 0, fraction: fraction >>> 0 };
 }
 
