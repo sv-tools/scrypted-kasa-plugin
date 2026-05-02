@@ -81,8 +81,9 @@ export class KasaTalkSession {
         // audio part we write is small (~230 B) and fewer than the segment size, so Nagle
         // would coalesce parts waiting for an ACK or for the 200 ms deadline — adding
         // user-perceptible chunkiness on top of the inherent network round-trip. The talk
-        // session is a constant low-rate stream, exactly the workload Nagle hurts.
-        req.on('socket', socket => {
+        // session is a constant low-rate stream, exactly the workload Nagle hurts. `once`
+        // because ClientRequest only emits 'socket' a single time per request lifetime.
+        req.once('socket', socket => {
             socket.setNoDelay(true);
         });
 

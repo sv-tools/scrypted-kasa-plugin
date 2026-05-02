@@ -542,7 +542,6 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
             '-rtsp_transport', 'tcp',
             '-max_delay', '0',
             '-reorder_queue_size', '0',
-            '-rtbufsize', '32',
             '-thread_queue_size', '1',
             '-use_wallclock_as_timestamps', '1',
             ...(ffmpegInput.inputArguments || []),
