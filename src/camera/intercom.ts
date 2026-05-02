@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { ClientRequest } from 'http';
 import https from 'https';
+import net from 'net';
 import { PassThrough } from 'stream';
 
 export const KASA_TALK_PORT = 18443;
@@ -77,6 +78,21 @@ export class KasaTalkSession {
 
         this.request = req;
 
+        // Disable Nagle on the underlying TCP socket as soon as it's available. Each 20 ms
+        // audio part we write is small (~230 B) and fewer than the segment size, so Nagle
+        // would coalesce parts waiting for an ACK or for the 200 ms deadline — adding
+        // user-perceptible chunkiness on top of the inherent network round-trip. The talk
+        // session is a constant low-rate stream, exactly the workload Nagle hurts.
+        //
+        // Cover both timings: the default https.Agent pools connections and may assign a
+        // pooled socket synchronously inside https.request(), in which case `'socket'`
+        // already fired by the time we get here and our once-listener would never run.
+        // Check `req.socket` immediately, and otherwise register a once-listener for the
+        // fresh-connection path.
+        const setSocketNoDelay = (socket: net.Socket) => socket.setNoDelay(true);
+        if (req.socket) setSocketNoDelay(req.socket as net.Socket);
+        else req.once('socket', setSocketNoDelay);
+
         req.on('error', e => {
             // Suppress when the close came first (deliberate teardown via close()): ending
             // the body mid-flight makes the in-flight HTTPS request emit "socket hang up"
@@ -127,12 +143,19 @@ export class KasaTalkSession {
 
     private writePart(contentType: string, body: Buffer): boolean {
         if (this.closed) return true;
-        const header = `--${TALK_BOUNDARY}\r\nContent-Length: ${body.length}\r\nContent-Type: ${contentType}\r\n\r\n`;
-        // Only the last write's return value matters for backpressure — if any of these
-        // fills the buffer, Node will emit `drain` after the buffer empties.
-        this.body.write(header);
-        if (body.length) this.body.write(body);
-        return this.body.write('\r\n');
+        const header = Buffer.from(
+            `--${TALK_BOUNDARY}\r\nContent-Length: ${body.length}\r\nContent-Type: ${contentType}\r\n\r\n`,
+        );
+        // Concat header + body + CRLF into one write. Three separate writes would each
+        // become its own chunked-encoding chunk on the HTTP body and (worse) its own TLS
+        // record + TCP segment. Cameras and Node's HTTP/TLS stack both prefer one part
+        // arriving as one segment — fewer per-packet ACKs and no risk of the camera
+        // partially parsing a part header before the body lands.
+        const trailer = Buffer.from('\r\n');
+        const out = body.length
+            ? Buffer.concat([header, body, trailer], header.length + body.length + trailer.length)
+            : Buffer.concat([header, trailer], header.length + trailer.length);
+        return this.body.write(out);
     }
 
     close(): void {

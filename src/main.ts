@@ -502,16 +502,56 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         // -loglevel error + -nostats: without these, ffmpeg emits a `size= time= bitrate=`
         // progress line every ~0.5 s during the talkback session. On long talks that's a
         // steady stream of stderr → string allocations + log I/O for no diagnostic value.
+        //
+        // Low-latency knobs (without these, talkback lagged ~10 s — the symptom was hearing
+        // your own voice through the camera speaker only after releasing Push-to-Talk):
+        //   -fflags +nobuffer  : skip libavformat's input prebuffer (typically 1-2 s on SDP/SRTP).
+        //   -fflags +flush_packets, -flush_packets 1
+        //                      : flush the AVIO output buffer after every encoded packet
+        //                        instead of when the 32 KB buffer fills (~4 s of 8 kHz mulaw).
+        //                        The two forms cover both global flags and the output-muxer
+        //                        explicit option; cheap belt-and-suspenders.
+        //   -flags low_delay   : codec-level low-delay decode/encode flag.
+        //   -probesize 32, -analyzeduration 0
+        //                      : skip the auto-detect probe phase, which would otherwise
+        //                        wait for ~5 s of audio to estimate stream parameters
+        //                        before producing the first output sample.
+        //   -rtsp_transport tcp, -reorder_queue_size 0   (RTSP-only, conditional)
+        //                      : force TCP-interleaved RTP and zero the demuxer's
+        //                        out-of-order reordering window. Only emitted when the
+        //                        input URL is RTSP; for non-RTSP inputs ffmpeg would just
+        //                        warn "Option not found" but the conditional keeps the arg
+        //                        list honest about which demuxer each option targets.
+        //   -max_delay 0       : zero libavformat's max-delay setting. General — applies
+        //                        to several demuxers, including RTSP/RTP — so safe to pass
+        //                        unconditionally.
+        //   -af aresample=async=0:min_hard_comp=0
+        //                      : disable async resampling. ffmpeg auto-inserts aresample
+        //                        when input/output sample rates differ (Opus 24 kHz →
+        //                        mulaw 8 kHz); async=0 keeps it operating on tiny frames
+        //                        without the multi-second resync window async=1 introduces.
+        const inputArgs = ffmpegInput.inputArguments || [];
+        const isRtspInput = inputArgs.some(a => typeof a === 'string' && a.startsWith('rtsp://'));
         // prettier-ignore
         const args = [
             '-hide_banner',
             '-loglevel', 'error',
             '-nostats',
-            ...(ffmpegInput.inputArguments || []),
+            '-fflags', '+nobuffer+flush_packets',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-max_delay', '0',
+            ...(isRtspInput ? ['-rtsp_transport', 'tcp', '-reorder_queue_size', '0'] : []),
+            '-thread_queue_size', '1',
+            '-use_wallclock_as_timestamps', '1',
+            ...inputArgs,
             '-vn', '-sn', '-dn',
+            '-af', 'aresample=async=0:min_hard_comp=0',
             '-f', 'mulaw',
             '-ar', '8000',
             '-ac', '1',
+            '-flush_packets', '1',
             'pipe:1',
         ];
         const cp = child_process.spawn(ffmpegPath, args);
