@@ -17,6 +17,8 @@ For UI/runtime testing of changes, use the `scrypted` MCP server (already config
 
 Releases publish to npm automatically when a `v*` tag is pushed. The publish workflow uses npm provenance via GitHub OIDC — don't change the publish step lightly.
 
+The published tarball **must** contain `dist/plugin.zip` — Scrypted's `installNpm` reads `package/dist/plugin.zip` from the tarball and base64s its contents; if the file is missing, the install fails with `Cannot read properties of undefined (reading 'toString')`. `prepublishOnly` runs `NODE_ENV=production scrypted-webpack`, which writes to `dist/` (the dev build writes to `out/`). Both `out/` and `dist/` are in `.gitignore`, so we rely on the `"files": ["dist/plugin.zip"]` whitelist in `package.json` to override `.gitignore` for `npm pack`. v1.3.0 / v1.3.1 hit exactly this trap; v1.3.2 added the whitelist.
+
 ## Architecture
 
 Single Scrypted plugin (`KasaPlugin`) that adopts two unrelated TP-Link Kasa device families behind one discovery flow.
