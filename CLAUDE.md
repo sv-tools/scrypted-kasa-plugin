@@ -39,7 +39,7 @@ Single Scrypted plugin (`KasaPlugin`) that adopts two unrelated TP-Link Kasa dev
 
 `classifyKasa()` (in `main.ts`) only returns the four families auto-discovery can detect from sysinfo; `'dimmer'` is added later by `adoptIotDevice()` when the device exposes brightness, and the manual "Add device" dialog can persist any of the five.
 
-Camera child devices (spotlight, siren) use suffixed nativeIds (`<camera-id>-spotlight`, `-siren`). Anywhere we walk `getNativeIds()` (refresh, migrations, inventory), filter these out — they share the parent's sysinfo and would otherwise be re-published or double-counted.
+Camera child devices (spotlight, siren, privacy) use suffixed nativeIds (`<camera-id>-spotlight`, `-siren`, `-privacy`). Anywhere we walk `getNativeIds()` (refresh, migrations, inventory), filter these out with `isCameraChildNativeId()` — they share the parent's sysinfo and would otherwise be re-published or double-counted. A new child type must add its suffix to `CAMERA_CHILD_SUFFIXES`.
 
 ### Stream lifecycle and cleanup (cameras)
 
