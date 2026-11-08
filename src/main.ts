@@ -41,6 +41,18 @@ import { KasaSwitch } from './iot/switch';
 import { discoverKasa, KasaDiscoveredDevice } from './shared/discovery';
 import { formatKasaMac, renderKv } from './shared/readme';
 
+// Stream-server-down handling (see KasaCamera.explainStreamServerDown).
+// How long each failed stream attempt is held before it's reported, to slow the rebroadcast
+// plugin's ~5 s retry loop while the stream server is known to be dead.
+const STREAM_DOWN_RETRY_DELAY_MS = 30_000;
+// How long the stream must stay down before an auto-reboot, and the minimum gap between two.
+const STREAM_DOWN_REBOOT_AFTER_MS = 3 * 60_000;
+const AUTO_REBOOT_COOLDOWN_MS = 30 * 60_000;
+
+function isConnectionRefused(e: Error): boolean {
+    return (e as NodeJS.ErrnoException).code === 'ECONNREFUSED' || /\bECONNREFUSED\b/.test(e.message);
+}
+
 // G.711 µ-law packetization: 8000 samples/sec * 1 byte/sample = 160 bytes/20ms.
 // 20 ms is the standard RTP packetization for PCMU and matches what the Kasa app appears
 // to use for its uplink chunks during active talk.
@@ -234,6 +246,11 @@ class KasaCamera
     // Set while stream attempts are failing because the camera is turned off, so the
     // "turned off" / "back on" transitions are logged once instead of on every retry.
     private cameraOffLogged = false;
+    // Set while :19443 refuses connections but the control plane still answers: the camera's
+    // stream server has died. Holds the time we first saw it, for the one-shot log line, the
+    // recovery message, and the auto-reboot grace period.
+    private streamDownSince?: number;
+    private lastAutoRebootAt = 0;
     // Kill switches for any in-flight video streams. Stored so we can tear them down when
     // the user changes network/auth settings — otherwise the existing TCP connection keeps
     // talking to the old IP and clients see "phantom" video from a stale endpoint.
@@ -411,6 +428,15 @@ class KasaCamera
             type: 'password',
             description: 'The TP-Link/Kasa account password.',
         },
+        autoReboot: {
+            title: 'Auto-reboot when video stops',
+            type: 'boolean',
+            defaultValue: false,
+            description:
+                'Reboot the camera automatically when its video stream has refused connections for ' +
+                `${STREAM_DOWN_REBOOT_AFTER_MS / 60_000} minutes while it still answers controls. ` +
+                `At most once every ${AUTO_REBOOT_COOLDOWN_MS / 60_000} minutes.`,
+        },
     });
 
     async getSettings(): Promise<Setting[]> {
@@ -555,6 +581,7 @@ class KasaCamera
     // 503. The rebroadcast plugin retries every ~5 s and logs each failure with its stack, so
     // confirm the cause once and hand back a short, stack-less error instead.
     private async explainStreamError(e: Error): Promise<Error> {
+        if (isConnectionRefused(e)) return this.explainStreamServerDown(e);
         if (!/HTTP 503\b/.test(e.message)) return e;
         if ((await this.linkie().getCameraEnabled()) !== 'off') return e;
         if (!this.cameraOffLogged) {
@@ -566,6 +593,50 @@ class KasaCamera
         // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
         off.stack = off.message;
         return off;
+    }
+
+    // :19443 refusing connections while :10443 still answers means the camera's stream server
+    // died (see Reboot camera). The rebroadcast plugin retries every ~5 s and logs every failure
+    // with a multi-line stack, so: log the state once, hand back a short stack-less error, hold
+    // each failure for STREAM_DOWN_RETRY_DELAY_MS so the retries slow down, and optionally reboot
+    // the camera once the outage has lasted long enough.
+    private async explainStreamServerDown(e: Error): Promise<Error> {
+        // No answer from the control plane either: the camera is off the network, not a dead
+        // stream server. Leave that error alone.
+        if ((await this.linkie().getCameraEnabled()) === undefined) return e;
+
+        const { port, autoReboot } = this.storageSettings.values;
+        const now = Date.now();
+        if (this.streamDownSince === undefined) {
+            this.streamDownSince = now;
+            this.console.warn(
+                `video stream server is down (connection refused on :${port || KASA_DEFAULT_PORT}) while the camera ` +
+                    'still answers controls. ' +
+                    (autoReboot
+                        ? `It will be rebooted if this lasts ${STREAM_DOWN_REBOOT_AFTER_MS / 60_000} minutes.`
+                        : 'Press Reboot camera in Settings, or turn on Auto-reboot when video stops.'),
+            );
+        }
+
+        if (
+            autoReboot &&
+            now - this.streamDownSince >= STREAM_DOWN_REBOOT_AFTER_MS &&
+            now - this.lastAutoRebootAt >= AUTO_REBOOT_COOLDOWN_MS
+        ) {
+            this.lastAutoRebootAt = now;
+            this.console.warn(
+                `video stream has been down for ${Math.round((now - this.streamDownSince) / 1000)} s; rebooting the camera`,
+            );
+            this.linkie()
+                .reboot()
+                .catch(err => this.console.warn('auto-reboot failed:', (err as Error).message));
+        }
+
+        await new Promise(r => setTimeout(r, STREAM_DOWN_RETRY_DELAY_MS));
+        const down = new Error('Kasa camera video stream is down (connection refused)');
+        // Drop the stack: the state is already logged once above, and this is logged on every retry.
+        down.stack = down.message;
+        return down;
     }
 
     async getVideoStream(_options?: RequestMediaStreamOptions): Promise<MediaObject> {
@@ -584,6 +655,10 @@ class KasaCamera
             });
         } catch (e) {
             throw await this.explainStreamError(e as Error);
+        }
+        if (this.streamDownSince !== undefined) {
+            this.console.log(`video stream is back after ${Math.round((Date.now() - this.streamDownSince) / 1000)} s`);
+            this.streamDownSince = undefined;
         }
         if (this.cameraOffLogged) {
             this.cameraOffLogged = false;
