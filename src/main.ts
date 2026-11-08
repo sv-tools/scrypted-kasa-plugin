@@ -42,9 +42,14 @@ import { discoverKasa, KasaDiscoveredDevice } from './shared/discovery';
 import { formatKasaMac, renderKv } from './shared/readme';
 
 // Stream-server-down handling (see KasaCamera.explainStreamServerDown).
+// Ceiling for any hold inside getVideoStream. The objectdetector plugin ends a Video Analysis
+// session (and logs "VideoAnalysis is hung") once its getVideoStream has been waiting over 30 s,
+// and that clock includes the rebroadcast plugin's own 5 s restart delay plus our connect and
+// switch check (~1 s), so stay well under 30 - 5 - 1.
+const MAX_STREAM_HOLD_MS = 18_000;
 // How long each failed stream attempt is held before it's reported, to slow the rebroadcast
 // plugin's ~5 s retry loop while the stream server is known to be dead.
-const STREAM_DOWN_RETRY_DELAY_MS = 30_000;
+const STREAM_DOWN_RETRY_DELAY_MS = MAX_STREAM_HOLD_MS;
 // How long the stream must stay down before an auto-reboot, and the minimum gap between two.
 const STREAM_DOWN_REBOOT_AFTER_MS = 3 * 60_000;
 const AUTO_REBOOT_COOLDOWN_MS = 30 * 60_000;
@@ -52,8 +57,8 @@ const AUTO_REBOOT_COOLDOWN_MS = 30 * 60_000;
 // While the camera is turned off (Privacy Mode), how long a stream attempt is held before it
 // fails, and how often the switch is polled meanwhile. Turning Privacy Mode off through the
 // switch device wakes the hold immediately.
-const CAMERA_OFF_HOLD_MS = 60_000;
-const CAMERA_OFF_POLL_MS = 10_000;
+const CAMERA_OFF_HOLD_MS = MAX_STREAM_HOLD_MS;
+const CAMERA_OFF_POLL_MS = 5_000;
 
 // The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
 class CameraOffError extends Error {}
@@ -661,8 +666,7 @@ class KasaCamera
     // polling the switch. Returns true as soon as the camera is back on (so the caller can
     // connect right away), false if it's still off when the hold runs out. The hold is what
     // slows the rebroadcast plugin's ~5 s retry loop during a long Privacy Mode stretch.
-    private async waitForCameraOn(): Promise<boolean> {
-        const deadline = Date.now() + CAMERA_OFF_HOLD_MS;
+    private async waitForCameraOn(deadline: number): Promise<boolean> {
         while (Date.now() < deadline) {
             await new Promise<void>(resolve => {
                 const wake = () => {
@@ -673,13 +677,23 @@ class KasaCamera
                 const timer = setTimeout(wake, Math.min(CAMERA_OFF_POLL_MS, Math.max(0, deadline - Date.now())));
                 this.cameraOffWaiters.add(wake);
             });
-            if ((await this.linkie().getCameraEnabled()) === 'on') return true;
+            // The switch check can take up to the LINKIE timeout; never let it run past the
+            // deadline, or the hold creeps over the Video Analysis watchdog.
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            const state = await Promise.race([
+                this.linkie().getCameraEnabled(),
+                new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), remaining)),
+            ]);
+            if (state === 'on') return true;
         }
         return false;
     }
 
     async getVideoStream(_options?: RequestMediaStreamOptions): Promise<MediaObject> {
         const { ip, port, username, password } = this.storageSettings.values;
+        // Any hold below counts from here, so the connect and switch checks are inside the budget.
+        const holdDeadline = Date.now() + CAMERA_OFF_HOLD_MS;
 
         if (!ip || !username || !password)
             throw new Error('Kasa camera is not configured. Set IP, username, and password.');
@@ -697,7 +711,8 @@ class KasaCamera
                 });
             } catch (e) {
                 const err = await this.explainStreamError(e as Error);
-                if (!(err instanceof CameraOffError) || attempt >= 1 || !(await this.waitForCameraOn())) throw err;
+                if (!(err instanceof CameraOffError) || attempt >= 1 || !(await this.waitForCameraOn(holdDeadline)))
+                    throw err;
             }
         }
         if (this.streamDownSince !== undefined) {
