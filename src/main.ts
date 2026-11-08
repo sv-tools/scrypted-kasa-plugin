@@ -42,12 +42,26 @@ import { discoverKasa, KasaDiscoveredDevice } from './shared/discovery';
 import { formatKasaMac, renderKv } from './shared/readme';
 
 // Stream-server-down handling (see KasaCamera.explainStreamServerDown).
+// Ceiling for any hold inside getVideoStream. The objectdetector plugin ends a Video Analysis
+// session (and logs "VideoAnalysis is hung") once its getVideoStream has been waiting over 30 s,
+// and that clock includes the rebroadcast plugin's own 5 s restart delay plus our connect and
+// switch check (~1 s), so stay well under 30 - 5 - 1.
+const MAX_STREAM_HOLD_MS = 18_000;
 // How long each failed stream attempt is held before it's reported, to slow the rebroadcast
 // plugin's ~5 s retry loop while the stream server is known to be dead.
-const STREAM_DOWN_RETRY_DELAY_MS = 30_000;
+const STREAM_DOWN_RETRY_DELAY_MS = MAX_STREAM_HOLD_MS;
 // How long the stream must stay down before an auto-reboot, and the minimum gap between two.
 const STREAM_DOWN_REBOOT_AFTER_MS = 3 * 60_000;
 const AUTO_REBOOT_COOLDOWN_MS = 30 * 60_000;
+
+// While the camera is turned off (Privacy Mode), how long a stream attempt is held before it
+// fails, and how often the switch is polled meanwhile. Turning Privacy Mode off through the
+// switch device wakes the hold immediately.
+const CAMERA_OFF_HOLD_MS = MAX_STREAM_HOLD_MS;
+const CAMERA_OFF_POLL_MS = 5_000;
+
+// The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
+class CameraOffError extends Error {}
 
 function isConnectionRefused(e: Error): boolean {
     return (e as NodeJS.ErrnoException).code === 'ECONNREFUSED' || /\bECONNREFUSED\b/.test(e.message);
@@ -218,6 +232,9 @@ class KasaCameraPrivacy extends ScryptedDeviceBase implements OnOff {
     async turnOff(): Promise<void> {
         await this.camera.linkie().setCameraEnabled(true);
         this.on = false;
+        // A stream attempt may be parked waiting for the camera to come back on; let it
+        // connect now instead of at its next poll.
+        this.camera.wakeCameraOffWaiters();
     }
 }
 
@@ -246,6 +263,8 @@ class KasaCamera
     // Set while stream attempts are failing because the camera is turned off, so the
     // "turned off" / "back on" transitions are logged once instead of on every retry.
     private cameraOffLogged = false;
+    // Stream attempts parked in waitForCameraOn(), woken early when Privacy Mode is turned off.
+    private cameraOffWaiters = new Set<() => void>();
     // Set while :19443 refuses connections but the control plane still answers: the camera's
     // stream server has died. Holds the time we first saw it, for the one-shot log line, the
     // recovery message, and the auto-reboot grace period.
@@ -589,7 +608,7 @@ class KasaCamera
             this.console.log('camera is turned off (privacy mode); video is unavailable until it is turned back on');
         }
         if (this.privacy) this.privacy.on = true;
-        const off = new Error('Kasa camera is turned off (privacy mode)');
+        const off = new CameraOffError('Kasa camera is turned off (privacy mode)');
         // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
         off.stack = off.message;
         return off;
@@ -639,22 +658,62 @@ class KasaCamera
         return down;
     }
 
+    wakeCameraOffWaiters(): void {
+        for (const wake of [...this.cameraOffWaiters]) wake();
+    }
+
+    // Holds a stream attempt while the camera is turned off, for up to CAMERA_OFF_HOLD_MS,
+    // polling the switch. Returns true as soon as the camera is back on (so the caller can
+    // connect right away), false if it's still off when the hold runs out. The hold is what
+    // slows the rebroadcast plugin's ~5 s retry loop during a long Privacy Mode stretch.
+    private async waitForCameraOn(deadline: number): Promise<boolean> {
+        while (Date.now() < deadline) {
+            await new Promise<void>(resolve => {
+                const wake = () => {
+                    clearTimeout(timer);
+                    this.cameraOffWaiters.delete(wake);
+                    resolve();
+                };
+                const timer = setTimeout(wake, Math.min(CAMERA_OFF_POLL_MS, Math.max(0, deadline - Date.now())));
+                this.cameraOffWaiters.add(wake);
+            });
+            // The switch check can take up to the LINKIE timeout; never let it run past the
+            // deadline, or the hold creeps over the Video Analysis watchdog.
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            const state = await Promise.race([
+                this.linkie().getCameraEnabled(),
+                new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), remaining)),
+            ]);
+            if (state === 'on') return true;
+        }
+        return false;
+    }
+
     async getVideoStream(_options?: RequestMediaStreamOptions): Promise<MediaObject> {
         const { ip, port, username, password } = this.storageSettings.values;
+        // Any hold below counts from here, so the connect and switch checks are inside the budget.
+        const holdDeadline = Date.now() + CAMERA_OFF_HOLD_MS;
 
         if (!ip || !username || !password)
             throw new Error('Kasa camera is not configured. Set IP, username, and password.');
 
-        let kasa: KasaClient;
-        try {
-            kasa = await KasaClient.connect({
-                ip,
-                port,
-                username,
-                password,
-            });
-        } catch (e) {
-            throw await this.explainStreamError(e as Error);
+        let kasa: KasaClient | undefined;
+        // A camera turned off (Privacy Mode) parks the attempt in waitForCameraOn() rather than
+        // failing at once; if it comes back on during the hold, connect again straight away.
+        for (let attempt = 0; !kasa; attempt++) {
+            try {
+                kasa = await KasaClient.connect({
+                    ip,
+                    port,
+                    username,
+                    password,
+                });
+            } catch (e) {
+                const err = await this.explainStreamError(e as Error);
+                if (!(err instanceof CameraOffError) || attempt >= 1 || !(await this.waitForCameraOn(holdDeadline)))
+                    throw err;
+            }
         }
         if (this.streamDownSince !== undefined) {
             this.console.log(`video stream is back after ${Math.round((Date.now() - this.streamDownSince) / 1000)} s`);
