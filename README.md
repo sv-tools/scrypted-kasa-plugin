@@ -169,9 +169,8 @@ setup below.
 - **One stream connection per camera.** The camera serves a single client on the stream
   port (19443); a second connection opens at the TCP level but stalls in the TLS handshake
   until it times out. Scrypted's rebroadcast (prebuffer) plugin holds that one connection
-  and fans it out to HomeKit, the NVR and other clients, so keep it enabled. Running the
-  Kasa app's live view, another NVR, or a manual `curl` against the camera at the same time
-  will fail or knock out Scrypted's stream.
+  and fans it out to HomeKit, the NVR and other clients, so keep it enabled. Another local
+  client (a second NVR, a manual `curl`) can't connect to the stream while Scrypted holds it.
 - Auto-discovery sweeps the local /24 only. Larger subnets (e.g. /23) are skipped to
   avoid flooding.
 
