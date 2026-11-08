@@ -26,8 +26,8 @@ In Scrypted:
 - Exposes the camera's spotlight (when present, e.g. KC420WS) as an `OnOff` child light
   device in the same room as the camera. Driven by the LINKIE2 control protocol on port
   10443.
-- Exposes the camera's siren (when present) as an `OnOff` child switch device, also in
-  the camera's room. Triggering it turns the siren on; the camera auto-stops after the
+- Exposes the camera's siren (when present) as an `OnOff` child siren device, also in
+  the camera's room. HomeKit shows it as a switch inside the camera accessory. Triggering it turns the siren on; the camera auto-stops after the
   duration configured in the Kasa app (default 30 s).
 - Exposes the camera's own on/off ("camera off" in the Kasa app) as a **Privacy Mode**
   child switch. On turns the camera off, which stops video for every client, not just

@@ -351,7 +351,9 @@ class KasaCamera
             await deviceManager.onDeviceDiscovered({
                 nativeId: this.sirenNativeId,
                 name: `${this.name || 'Kasa Camera'} Siren`,
-                type: ScryptedDeviceType.Switch,
+                // HomeKit folds a camera's Light and Siren children into the camera
+                // accessory; any other type is bridged as a standalone accessory.
+                type: ScryptedDeviceType.Siren,
                 interfaces: [ScryptedInterface.OnOff],
                 providerNativeId: this.nativeId,
                 room: this.room || undefined,
