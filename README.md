@@ -34,6 +34,10 @@ In Scrypted:
 - Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
   interface: step moves in the Scrypted and NVR camera views, plus the viewpoints saved in
   the Kasa app as presets. HomeKit has no pan/tilt support, so this is not visible there.
+- Adds a **Reboot camera** button to the camera's Settings tab
+  (`smartlife.cam.ipcamera.system.set_reboot` over LINKIE2). Useful when the video stream
+  stops — connection refused on port 19443 while the control port still answers — which
+  otherwise needs a power cycle. The camera is back after about 30 s.
 
 ## Plugs / Switches / Dimmers / Bulbs (legacy IOT protocol)
 

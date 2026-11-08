@@ -197,6 +197,19 @@ export class KasaLinkieClient {
         if (errCode !== 0) throw new Error(`siren set_state err_code=${errCode}`);
     }
 
+    // Reboot under smartlife.cam.ipcamera.system. Found by probing (not in any published
+    // client): `reboot` answers -10008, `set_reboot` is the real one. The camera drops off the
+    // network ~20 s later and is back with all ports open after ~30 s. Useful when the stream
+    // server on :19443 dies while the control plane stays up (connection refused on stream
+    // only) — that state otherwise needs a power cycle.
+    async reboot(): Promise<void> {
+        const r = await this.call({
+            'smartlife.cam.ipcamera.system': { set_reboot: {} },
+        });
+        const errCode = r?.['smartlife.cam.ipcamera.system']?.set_reboot?.err_code;
+        if (errCode !== 0) throw new Error(`system set_reboot err_code=${errCode}`);
+    }
+
     // Pan/tilt under smartlife.cam.ipcamera.ptz (KC410S "Spot Pan Tilt" and siblings).
     // Fixed-lens models answer every ptz method with -10008 "Unsupported API call", so a
     // successful get_capability doubles as the feature probe.

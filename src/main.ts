@@ -355,8 +355,18 @@ class KasaCamera
         },
     });
 
-    getSettings(): Promise<Setting[]> {
-        return this.storageSettings.getSettings();
+    async getSettings(): Promise<Setting[]> {
+        return [
+            ...(await this.storageSettings.getSettings()),
+            {
+                key: 'reboot',
+                title: 'Reboot camera',
+                description:
+                    'Restart the camera. Fixes a camera whose video stream stopped (connection refused ' +
+                    'on the stream port) while it still answers controls. It is offline for about 30 s.',
+                type: 'button',
+            },
+        ];
     }
 
     // Per-camera Readme tab. Surfaces what the user can't easily see otherwise: the
@@ -401,6 +411,15 @@ class KasaCamera
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key === 'reboot') {
+            this.console.log('rebooting camera');
+            await this.linkie().reboot();
+            // The camera is about to drop every socket anyway; closing ours now lets clients
+            // start their reconnect loop immediately instead of waiting for a read timeout.
+            for (const kill of [...this.activeStreamKills]) kill.resolve();
+            this.stopIntercom().catch(() => {});
+            return;
+        }
         await this.storageSettings.putSetting(key, value);
         if (key === 'ip' || key === 'port' || key === 'username' || key === 'password') {
             // Tear down active streams + intercom — they're holding TCP sockets to the old
