@@ -271,6 +271,7 @@ class KasaCamera
             const state = deviceManager.getDeviceState(this.nativeId);
             const provided = state?.providedInterfaces || [];
             if (state && this.nativeId && !provided.includes(ScryptedInterface.PanTiltZoom)) {
+                this.console.log(`pan/tilt detected (max_x=${ptzCapability.maxX}, max_y=${ptzCapability.maxY})`);
                 await deviceManager.onDeviceDiscovered({
                     nativeId: this.nativeId,
                     name: state.name || this.nativeId,
