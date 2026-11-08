@@ -31,6 +31,9 @@ In Scrypted:
   duration configured in the Kasa app (default 30 s).
 - Exposes the camera's **status LED** as the camera's own `OnOff` interface, so HomeKit's
   per-camera "Link Status Indicator" toggle drives the LED.
+- Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
+  interface: step moves in the Scrypted and NVR camera views, plus the viewpoints saved in
+  the Kasa app as presets. HomeKit has no pan/tilt support, so this is not visible there.
 
 ## Plugs / Switches / Dimmers / Bulbs (legacy IOT protocol)
 
@@ -129,7 +132,7 @@ setup below.
   features. Wire format: HTTPS POST `/data/LINKIE2.json`, body `application/x-www-form-
   urlencoded` with a single `content=<base64(xor_ab(json))>` field. The XOR-AB autokey
   cipher is the same one used by Kasa's UDP/9999 discovery protocol.
-- On adoption (and whenever credentials change) the plugin probes three LINKIE2 endpoints
+- On adoption (and whenever credentials change) the plugin probes these LINKIE2 endpoints
   serially:
   - `smartlife.cam.ipcamera.dayNight.get_force_lamp_state` — if it returns `on`/`off`, a
     child `OnOff` light device named "<camera> Spotlight" is registered in the camera's
@@ -141,6 +144,13 @@ setup below.
     it. Enable **Link Status Indicator** in the HomeKit plugin's per-camera settings to
     activate the binding.
 - Toggling any of the three calls the matching `set_*` method with `{"value": "on"|"off"}`.
+- `smartlife.cam.ipcamera.ptz.get_capability` — if it succeeds, `PanTiltZoom` is added to
+  the camera and `get_all_preset` populates its presets. Fixed-lens models answer with
+  `-10008` and are left alone. Moves use `set_move` with `{"direction":
+  "left"|"right"|"top"|"bottom", "speed": 1-10}`, where speed is the step size of a single
+  discrete step (Scrypted's -1..1 magnitude maps to `ceil(|v| * 10)`); presets use
+  `set_run_to_preset` with `{"index": n}`. There is no absolute-position, home, or zoom
+  command, so those PTZ movements are rejected.
 
 ## Notes / limitations
 
