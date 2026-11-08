@@ -187,6 +187,35 @@ class KasaCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 }
 
+// Child switch for the camera's own on/off, inverted so it reads naturally in HomeKit
+// automations ("when I arrive, turn on Kitchen Privacy Mode"): on = camera turned off.
+// Backed by smartlife.cam.ipcamera.switch.set_is_enable.
+class KasaCameraPrivacy extends ScryptedDeviceBase implements OnOff {
+    constructor(
+        public camera: KasaCamera,
+        nativeId: string,
+    ) {
+        super(nativeId);
+    }
+
+    async turnOn(): Promise<void> {
+        await this.camera.linkie().setCameraEnabled(false);
+        this.on = true;
+    }
+
+    async turnOff(): Promise<void> {
+        await this.camera.linkie().setCameraEnabled(true);
+        this.on = false;
+    }
+}
+
+// Camera child devices share the parent's sysinfo. Anything that walks getNativeIds()
+// (refresh, migrations, inventory) must skip them or they get re-published / double-counted.
+const CAMERA_CHILD_SUFFIXES = ['-spotlight', '-siren', '-privacy'];
+function isCameraChildNativeId(nativeId: string): boolean {
+    return CAMERA_CHILD_SUFFIXES.some(s => nativeId.endsWith(s));
+}
+
 // Scrypted PTZ magnitudes are -1..1; Kasa's set_move takes a 1..10 step size. Same
 // ceil(|v| * 10) mapping the Reolink plugin uses, so UI arrow taps behave alike across brands.
 function kasaPtzSpeed(v: number): number {
@@ -201,6 +230,10 @@ class KasaCamera
     private intercomFfmpeg?: ChildProcess;
     private spotlight?: KasaCameraSpotlight;
     private siren?: KasaCameraSiren;
+    private privacy?: KasaCameraPrivacy;
+    // Set while stream attempts are failing because the camera is turned off, so the
+    // "turned off" / "back on" transitions are logged once instead of on every retry.
+    private cameraOffLogged = false;
     // Kill switches for any in-flight video streams. Stored so we can tear them down when
     // the user changes network/auth settings — otherwise the existing TCP connection keeps
     // talking to the old IP and clients see "phantom" video from a stale endpoint.
@@ -235,6 +268,15 @@ class KasaCamera
         return `${this.nativeId}-siren`;
     }
 
+    private get privacyNativeId(): string {
+        return `${this.nativeId}-privacy`;
+    }
+
+    private getPrivacy(): KasaCameraPrivacy {
+        if (!this.privacy) this.privacy = new KasaCameraPrivacy(this, this.privacyNativeId);
+        return this.privacy;
+    }
+
     // Shared in-flight promise so concurrent triggers (constructor, putSetting,
     // post-adoption) don't run the LINKIE probe loop in parallel against the same camera.
     // The probes are sequential per call; running two in parallel would double the
@@ -259,6 +301,7 @@ class KasaCamera
         const ledState = await linkie.getLedStatus();
         const lampState = await linkie.getForceLampState();
         const sirenState = await linkie.getSirenState();
+        const cameraEnabled = await linkie.getCameraEnabled();
         const ptzCapability = await linkie.getPtzCapability();
         const ptzPresets = ptzCapability ? await linkie.getPtzPresets() : [];
 
@@ -316,6 +359,18 @@ class KasaCamera
             if (!this.siren) this.siren = new KasaCameraSiren(this, this.sirenNativeId);
             this.siren.on = sirenState === 'on';
         }
+
+        if (cameraEnabled !== undefined) {
+            await deviceManager.onDeviceDiscovered({
+                nativeId: this.privacyNativeId,
+                name: `${this.name || 'Kasa Camera'} Privacy Mode`,
+                type: ScryptedDeviceType.Switch,
+                interfaces: [ScryptedInterface.OnOff],
+                providerNativeId: this.nativeId,
+                room: this.room || undefined,
+            });
+            this.getPrivacy().on = cameraEnabled === 'off';
+        }
     }
 
     async getDevice(nativeId: string): Promise<any> {
@@ -327,6 +382,7 @@ class KasaCamera
             if (!this.siren) this.siren = new KasaCameraSiren(this, this.sirenNativeId);
             return this.siren;
         }
+        if (nativeId === this.privacyNativeId) return this.getPrivacy();
     }
 
     async releaseDevice(_id: string, _nativeId: string): Promise<void> {
@@ -493,18 +549,45 @@ class KasaCamera
         ];
     }
 
+    // A camera turned off (Kasa app or the Privacy Mode switch) answers the stream with HTTP
+    // 503. The rebroadcast plugin retries every ~5 s and logs each failure with its stack, so
+    // confirm the cause once and hand back a short, stack-less error instead.
+    private async explainStreamError(e: Error): Promise<Error> {
+        if (!/HTTP 503\b/.test(e.message)) return e;
+        if ((await this.linkie().getCameraEnabled()) !== 'off') return e;
+        if (!this.cameraOffLogged) {
+            this.cameraOffLogged = true;
+            this.console.log('camera is turned off (privacy mode); video is unavailable until it is turned back on');
+        }
+        if (this.privacy) this.privacy.on = true;
+        const off = new Error('Kasa camera is turned off (privacy mode)');
+        // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
+        off.stack = off.message;
+        return off;
+    }
+
     async getVideoStream(_options?: RequestMediaStreamOptions): Promise<MediaObject> {
         const { ip, port, username, password } = this.storageSettings.values;
 
         if (!ip || !username || !password)
             throw new Error('Kasa camera is not configured. Set IP, username, and password.');
 
-        const kasa = await KasaClient.connect({
-            ip,
-            port,
-            username,
-            password,
-        });
+        let kasa: KasaClient;
+        try {
+            kasa = await KasaClient.connect({
+                ip,
+                port,
+                username,
+                password,
+            });
+        } catch (e) {
+            throw await this.explainStreamError(e as Error);
+        }
+        if (this.cameraOffLogged) {
+            this.cameraOffLogged = false;
+            this.console.log('camera is back on, video resumed');
+            if (this.privacy) this.privacy.on = false;
+        }
 
         // Single shared kill switch: any teardown source (kasa close, RTSP client
         // disconnect, pump error) resolves it, and every owned resource registers a
@@ -854,9 +937,9 @@ class KasaPlugin
         const missing: string[] = [];
         for (const nativeId of deviceManager.getNativeIds()) {
             if (!nativeId) continue;
-            // Spotlight / siren children share the parent camera's sysinfo and are
+            // Camera children (spotlight / siren / privacy) share the parent camera's sysinfo and are
             // already maintained by KasaCamera.refreshChildDevices.
-            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            if (isCameraChildNativeId(nativeId)) continue;
             const state = deviceManager.getDeviceState(nativeId);
             if (!state) continue;
 
@@ -920,9 +1003,9 @@ class KasaPlugin
     private async migrateAddReadme(): Promise<void> {
         for (const nativeId of deviceManager.getNativeIds()) {
             if (!nativeId) continue;
-            // Spotlight / siren children only expose OnOff — no Readme to add. They're
+            // Camera children only expose OnOff — no Readme to add. They're
             // re-published by KasaCamera.refreshChildDevices anyway.
-            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            if (isCameraChildNativeId(nativeId)) continue;
             const state = deviceManager.getDeviceState(nativeId);
             if (!state) continue;
             // providedInterfaces is the list this plugin originally registered; the
@@ -961,7 +1044,7 @@ class KasaPlugin
 
         for (const nativeId of deviceManager.getNativeIds()) {
             if (!nativeId) continue;
-            if (nativeId.endsWith('-spotlight') || nativeId.endsWith('-siren')) continue;
+            if (isCameraChildNativeId(nativeId)) continue;
 
             const state = deviceManager.getDeviceState(nativeId);
             if (!state) continue;

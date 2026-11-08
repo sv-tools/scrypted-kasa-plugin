@@ -197,6 +197,33 @@ export class KasaLinkieClient {
         if (errCode !== 0) throw new Error(`siren set_state err_code=${errCode}`);
     }
 
+    // The camera's own on/off ("camera off" in the Kasa app), under smartlife.cam.ipcamera.switch.
+    // Off stops video for every client, not just HomeKit: the stream port stays open but answers
+    // HTTP 503 until it's turned back on, and the next stream attempt after that succeeds.
+
+    async getCameraEnabled(): Promise<'on' | 'off' | undefined> {
+        try {
+            const r = await this.call({
+                'smartlife.cam.ipcamera.switch': { get_is_enable: {} },
+            });
+            const v = r?.['smartlife.cam.ipcamera.switch']?.get_is_enable?.value;
+            return v === 'on' || v === 'off' ? v : undefined;
+        } catch (e) {
+            this.logger?.warn?.('kasa linkie get_is_enable (switch) failed:', (e as Error).message);
+            return undefined;
+        }
+    }
+
+    async setCameraEnabled(on: boolean): Promise<void> {
+        const r = await this.call({
+            'smartlife.cam.ipcamera.switch': {
+                set_is_enable: { value: on ? 'on' : 'off' },
+            },
+        });
+        const errCode = r?.['smartlife.cam.ipcamera.switch']?.set_is_enable?.err_code;
+        if (errCode !== 0) throw new Error(`switch set_is_enable err_code=${errCode}`);
+    }
+
     // Reboot under smartlife.cam.ipcamera.system. Found by probing (not in any published
     // client): `reboot` answers -10008, `set_reboot` is the real one. The camera drops off the
     // network ~20 s later and is back with all ports open after ~30 s. Useful when the stream
