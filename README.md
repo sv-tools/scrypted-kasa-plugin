@@ -37,7 +37,9 @@ In Scrypted:
   HomeKit plugin with PrivacyMode support binds it to the camera's on/off in the Home app
   (including Home/Away camera modes). That needs HomeKit Secure Video recording (a motion
   source, or HomeKit Secure Video 3) and is turned on per camera with the HomeKit plugin's
-  **Camera Privacy Mode** setting.
+  **Camera Privacy Mode** setting. Home hubs reapply the Home app's camera mode whenever
+  they reconnect, so turning the camera on or off here or in the Kasa app only lasts until
+  then.
 - Exposes the camera's **status LED** as the camera's own `OnOff` interface, so HomeKit's
   per-camera "Link Status Indicator" toggle drives the LED.
 - Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
