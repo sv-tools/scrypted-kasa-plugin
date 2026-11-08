@@ -31,6 +31,20 @@ export interface KasaLinkieClientLogger {
 //   - Each request body adds a `context.source` UUID — the camera ignores it but the field
 //     is always present in captures, so we generate one per call.
 //   - Response: same encoding, with the result merged under the same module/method keys.
+// Directions accepted by smartlife.cam.ipcamera.ptz.set_move. Matched exactly and
+// lowercase; `up`/`down` are rejected with -41203 — the firmware says top/bottom.
+export type KasaPtzDirection = 'left' | 'right' | 'top' | 'bottom';
+
+export interface KasaPtzCapability {
+    maxX: number;
+    maxY: number;
+}
+
+export interface KasaPtzPreset {
+    index: number;
+    name: string;
+}
+
 export class KasaLinkieClient {
     constructor(
         public options: KasaLinkieOptions,
@@ -181,5 +195,63 @@ export class KasaLinkieClient {
         });
         const errCode = r?.['smartlife.cam.ipcamera.siren']?.set_state?.err_code;
         if (errCode !== 0) throw new Error(`siren set_state err_code=${errCode}`);
+    }
+
+    // Pan/tilt under smartlife.cam.ipcamera.ptz (KC410S "Spot Pan Tilt" and siblings).
+    // Fixed-lens models answer every ptz method with -10008 "Unsupported API call", so a
+    // successful get_capability doubles as the feature probe.
+
+    async getPtzCapability(): Promise<KasaPtzCapability | undefined> {
+        try {
+            const r = await this.call({
+                'smartlife.cam.ipcamera.ptz': { get_capability: {} },
+            });
+            const v = r?.['smartlife.cam.ipcamera.ptz']?.get_capability;
+            if (v?.err_code !== 0 || typeof v.max_x !== 'number' || typeof v.max_y !== 'number') return undefined;
+            return { maxX: v.max_x, maxY: v.max_y };
+        } catch (e) {
+            this.logger?.warn?.('kasa linkie get_capability (ptz) failed:', (e as Error).message);
+            return undefined;
+        }
+    }
+
+    async getPtzPresets(): Promise<KasaPtzPreset[]> {
+        try {
+            const r = await this.call({
+                'smartlife.cam.ipcamera.ptz': { get_all_preset: {} },
+            });
+            const v = r?.['smartlife.cam.ipcamera.ptz']?.get_all_preset;
+            if (v?.err_code !== 0 || !Array.isArray(v.preset_attr)) return [];
+            // Entry shape isn't documented anywhere we've found. set_run_to_preset takes a
+            // 1-based index (the Kasa app's "viewpoint" number), so fall back to position when
+            // an entry doesn't carry its own index.
+            return v.preset_attr.map((p: any, i: number) => {
+                const index = typeof p?.index === 'number' ? p.index : i + 1;
+                const name = typeof p?.name === 'string' && p.name.trim() ? p.name : `Viewpoint ${index}`;
+                return { index, name };
+            });
+        } catch (e) {
+            this.logger?.warn?.('kasa linkie get_all_preset (ptz) failed:', (e as Error).message);
+            return [];
+        }
+    }
+
+    // `speed` is the step size, not a rate: each call moves one discrete step (1 ≈ 50 units,
+    // 10 ≈ 333 units on the tilt axis) and the camera stops on its own. 0 or >10 is rejected.
+    async ptzMove(direction: KasaPtzDirection, speed: number): Promise<void> {
+        const r = await this.call({
+            'smartlife.cam.ipcamera.ptz': { set_move: { direction, speed } },
+        });
+        const errCode = r?.['smartlife.cam.ipcamera.ptz']?.set_move?.err_code;
+        // -41203 covers both a bad value and an axis already at its end stop.
+        if (errCode !== 0) throw new Error(`ptz set_move ${direction} err_code=${errCode}`);
+    }
+
+    async ptzRunToPreset(index: number): Promise<void> {
+        const r = await this.call({
+            'smartlife.cam.ipcamera.ptz': { set_run_to_preset: { index } },
+        });
+        const errCode = r?.['smartlife.cam.ipcamera.ptz']?.set_run_to_preset?.err_code;
+        if (errCode !== 0) throw new Error(`ptz set_run_to_preset ${index} err_code=${errCode}`);
     }
 }

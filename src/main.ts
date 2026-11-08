@@ -10,6 +10,9 @@ import sdk, {
     Intercom,
     MediaObject,
     OnOff,
+    PanTiltZoom,
+    PanTiltZoomCommand,
+    PanTiltZoomMovement,
     Readme,
     RequestMediaStreamOptions,
     ResponseMediaStreamOptions,
@@ -28,7 +31,7 @@ import child_process, { ChildProcess } from 'child_process';
 import { randomBytes } from 'crypto';
 import { KASA_DEFAULT_PORT, KasaClient } from './camera/api';
 import { KASA_TALK_PORT, KasaTalkSession } from './camera/intercom';
-import { KasaLinkieClient } from './camera/linkie';
+import { KasaLinkieClient, KasaPtzDirection } from './camera/linkie';
 import { KasaStreamHandle, registerLiveCleanup, spawnKasaStream } from './camera/stream';
 import { KasaBulb } from './iot/bulb';
 import { KasaDimmer } from './iot/dimmer';
@@ -184,7 +187,16 @@ class KasaCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 }
 
-class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, Readme {
+// Scrypted PTZ magnitudes are -1..1; Kasa's set_move takes a 1..10 step size. Same
+// ceil(|v| * 10) mapping the Reolink plugin uses, so UI arrow taps behave alike across brands.
+function kasaPtzSpeed(v: number): number {
+    return Math.min(10, Math.max(1, Math.ceil(Math.abs(v) * 10)));
+}
+
+class KasaCamera
+    extends ScryptedDeviceBase
+    implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, PanTiltZoom, Readme
+{
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
     private spotlight?: KasaCameraSpotlight;
@@ -247,8 +259,34 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
         const ledState = await linkie.getLedStatus();
         const lampState = await linkie.getForceLampState();
         const sirenState = await linkie.getSirenState();
+        const ptzCapability = await linkie.getPtzCapability();
+        const ptzPresets = ptzCapability ? await linkie.getPtzPresets() : [];
 
         if (ledState !== undefined) this.on = ledState === 'on';
+
+        if (ptzCapability) {
+            // PanTiltZoom is added on the camera itself (not a child), so only re-publish when
+            // it's missing. Never removed on a failed probe: an unreachable camera looks the
+            // same as an unsupported one, and the hardware can't lose its motor.
+            const state = deviceManager.getDeviceState(this.nativeId);
+            const provided = state?.providedInterfaces || [];
+            if (state && this.nativeId && !provided.includes(ScryptedInterface.PanTiltZoom)) {
+                await deviceManager.onDeviceDiscovered({
+                    nativeId: this.nativeId,
+                    name: state.name || this.nativeId,
+                    type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
+                    interfaces: [...provided, ScryptedInterface.PanTiltZoom],
+                    info: state.info,
+                    room: state.room || undefined,
+                });
+            }
+            this.ptzCapabilities = {
+                pan: true,
+                tilt: true,
+                zoom: false,
+                presets: Object.fromEntries(ptzPresets.map(p => [String(p.index), p.name])),
+            };
+        }
 
         if (lampState !== undefined) {
             await deviceManager.onDeviceDiscovered({
@@ -388,6 +426,33 @@ class KasaCamera extends ScryptedDeviceBase implements VideoCamera, Settings, In
     async turnOff(): Promise<void> {
         await this.linkie().setLedStatus(false);
         this.on = false;
+    }
+
+    // Kasa only exposes discrete direction steps and saved viewpoints — there's no absolute
+    // positioning, home command, or zoom. set_move's smallest step is ~50 units, so Absolute
+    // can't be emulated precisely either; reject those instead of approximating.
+    async ptzCommand(command: PanTiltZoomCommand): Promise<void> {
+        const linkie = this.linkie();
+        if (command.movement === PanTiltZoomMovement.Preset || command.preset !== undefined) {
+            const index = Number(command.preset);
+            if (!Number.isInteger(index)) throw new Error(`invalid Kasa PTZ preset: ${command.preset}`);
+            await linkie.ptzRunToPreset(index);
+            return;
+        }
+        if (command.movement === PanTiltZoomMovement.Absolute || command.movement === PanTiltZoomMovement.Home) {
+            throw new Error(`Kasa cameras do not support ${command.movement} PTZ movement`);
+        }
+
+        // Relative (default) and Continuous both map to one step per axis. Sequential, like
+        // the other LINKIE2 calls: parallel requests to one camera occasionally drop responses.
+        if (command.pan) {
+            const dir: KasaPtzDirection = command.pan > 0 ? 'right' : 'left';
+            await linkie.ptzMove(dir, kasaPtzSpeed(command.pan));
+        }
+        if (command.tilt) {
+            const dir: KasaPtzDirection = command.tilt > 0 ? 'top' : 'bottom';
+            await linkie.ptzMove(dir, kasaPtzSpeed(command.tilt));
+        }
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
