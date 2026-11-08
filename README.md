@@ -34,6 +34,10 @@ In Scrypted:
 - Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
   interface: step moves in the Scrypted and NVR camera views, plus the viewpoints saved in
   the Kasa app as presets. HomeKit has no pan/tilt support, so this is not visible there.
+- Adds a **Reboot camera** button to the camera's Settings tab
+  (`smartlife.cam.ipcamera.system.set_reboot` over LINKIE2). Useful when the video stream
+  stops — connection refused on port 19443 while the control port still answers — which
+  otherwise needs a power cycle. The camera is back after about 30 s.
 
 ## Plugs / Switches / Dimmers / Bulbs (legacy IOT protocol)
 
@@ -162,6 +166,11 @@ setup below.
   header on the very first request — the camera silently drops requests that don't look
   enough like the official app.
 - The camera presents a self-signed TLS certificate; certificate verification is disabled.
+- **One stream connection per camera.** The camera serves a single client on the stream
+  port (19443); a second connection opens at the TCP level but stalls in the TLS handshake
+  until it times out. Scrypted's rebroadcast (prebuffer) plugin holds that one connection
+  and fans it out to HomeKit, the NVR and other clients, so keep it enabled. Another local
+  client (a second NVR, a manual `curl`) can't connect to the stream while Scrypted holds it.
 - Auto-discovery sweeps the local /24 only. Larger subnets (e.g. /23) are skipped to
   avoid flooding.
 
