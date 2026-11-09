@@ -3,23 +3,24 @@ import { ClientRequest } from 'http';
 import https from 'https';
 import net from 'net';
 import { PassThrough } from 'stream';
+import { kasaControlAuth } from './http';
 
 export const KASA_TALK_PORT = 18443;
 const KASA_TALK_PATH = '/https/speaker/audio/g711block';
 const TALK_BOUNDARY = 'audio-boundary--';
-
-// Talk-channel auth uses md5(plaintext) as the password rather than the base64(plaintext)
-// the receive stream uses. Same camera, different scheme — observed on KC420WS firmware
-// 2.3.26 via mitmproxy capture of the official Kasa iOS app.
-function md5Hex(plaintext: string): string {
-    return crypto.createHash('md5').update(plaintext, 'utf8').digest('hex');
-}
 
 // The Kasa app sends X-APP-ID/playerId of the form "tty.<32 base64-ish chars>". The token
 // looks app-generated (not negotiated with the camera), so we mint our own per-session.
 function generatePlayerId(): string {
     return 'tty.' + crypto.randomBytes(24).toString('base64').replace(/[+/=]/g, '').slice(0, 32);
 }
+
+function partHeader(contentType: string, length: number): Buffer {
+    return Buffer.from(`--${TALK_BOUNDARY}\r\nContent-Length: ${length}\r\nContent-Type: ${contentType}\r\n\r\n`);
+}
+const PART_TRAILER = Buffer.from('\r\n');
+// An empty part; the app sends one about every 3 s to keep the connection alive during silence.
+const HEARTBEAT_PART = Buffer.concat([partHeader('audio/heartbeat', 0), PART_TRAILER]);
 
 export interface KasaTalkOptions {
     ip: string;
@@ -40,23 +41,15 @@ export class KasaTalkSession {
     private heartbeatTimer?: NodeJS.Timeout;
     private closed = false;
     private closeCallbacks?: (() => void)[] = [];
-    // Resolves once the session is torn down (by the caller, by the camera ending the
-    // response, or by an error). Lets the camera's startIntercom await teardown to clean
-    // up its ffmpeg process when the uplink dies on its own.
-    readonly closedPromise: Promise<void>;
-    private resolveClosed!: () => void;
+    // Audio blocks all have the same size, so their part header is built once and reused.
+    private audioHeader?: { length: number; header: Buffer };
 
-    constructor(public options: KasaTalkOptions) {
-        this.closedPromise = new Promise<void>(resolve => {
-            this.resolveClosed = resolve;
-        });
-    }
+    constructor(public options: KasaTalkOptions) {}
 
     async start(): Promise<void> {
         this.playerId = generatePlayerId();
         const port = this.options.port || KASA_TALK_PORT;
-        const auth =
-            'Basic ' + Buffer.from(`${this.options.username}:${md5Hex(this.options.password)}`).toString('base64');
+        const auth = kasaControlAuth(this.options.username, this.options.password);
 
         const search = new URLSearchParams({ playerId: this.playerId });
 
@@ -113,10 +106,8 @@ export class KasaTalkSession {
         this.body.pipe(req);
 
         // Heartbeat immediately + every 3 s, mirroring the Kasa app's idle pattern.
-        this.writePart('audio/heartbeat', Buffer.alloc(0));
-        this.heartbeatTimer = setInterval(() => {
-            this.writePart('audio/heartbeat', Buffer.alloc(0));
-        }, 3000);
+        this.write(HEARTBEAT_PART);
+        this.heartbeatTimer = setInterval(() => this.write(HEARTBEAT_PART), 3000);
     }
 
     // Returns false when the underlying stream is asking for backpressure (Node's standard
@@ -124,7 +115,17 @@ export class KasaTalkSession {
     // this so an unhealthy/slow camera socket can't grow the PassThrough buffer without bound.
     writeAudio(chunk: Buffer): boolean {
         if (!chunk.length) return true;
-        return this.writePart('audio/g711u', chunk);
+        if (this.audioHeader?.length !== chunk.length)
+            this.audioHeader = { length: chunk.length, header: partHeader('audio/g711u', chunk.length) };
+        const { header } = this.audioHeader;
+        // Header + body + CRLF in one write. Three separate writes would each become its own
+        // chunked-encoding chunk on the HTTP body and (worse) its own TLS record + TCP segment.
+        // Cameras and Node's HTTP/TLS stack both prefer one part arriving as one segment —
+        // fewer per-packet ACKs and no risk of the camera partially parsing a part header
+        // before the body lands.
+        return this.write(
+            Buffer.concat([header, chunk, PART_TRAILER], header.length + chunk.length + PART_TRAILER.length),
+        );
     }
 
     onDrain(cb: () => void): void {
@@ -141,21 +142,9 @@ export class KasaTalkSession {
         this.closeCallbacks!.push(cb);
     }
 
-    private writePart(contentType: string, body: Buffer): boolean {
+    private write(part: Buffer): boolean {
         if (this.closed) return true;
-        const header = Buffer.from(
-            `--${TALK_BOUNDARY}\r\nContent-Length: ${body.length}\r\nContent-Type: ${contentType}\r\n\r\n`,
-        );
-        // Concat header + body + CRLF into one write. Three separate writes would each
-        // become its own chunked-encoding chunk on the HTTP body and (worse) its own TLS
-        // record + TCP segment. Cameras and Node's HTTP/TLS stack both prefer one part
-        // arriving as one segment — fewer per-packet ACKs and no risk of the camera
-        // partially parsing a part header before the body lands.
-        const trailer = Buffer.from('\r\n');
-        const out = body.length
-            ? Buffer.concat([header, body, trailer], header.length + body.length + trailer.length)
-            : Buffer.concat([header, trailer], header.length + trailer.length);
-        return this.body.write(out);
+        return this.body.write(part);
     }
 
     close(): void {
@@ -181,6 +170,5 @@ export class KasaTalkSession {
                 }
             }
         }
-        this.resolveClosed();
     }
 }

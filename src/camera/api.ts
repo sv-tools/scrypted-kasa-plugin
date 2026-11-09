@@ -2,6 +2,7 @@ import { once } from 'events';
 import https from 'https';
 import type { IncomingMessage } from 'http';
 import type { Readable } from 'stream';
+import { kasaStreamAuth, markStaleSocket, retryStaleSocketOnce } from './http';
 
 // Kasa cameras serve a non-standard mixed multipart stream over HTTPS on this port/path.
 // Reverse-engineered: https://medium.com/@hu3vjeen/reverse-engineering-tp-link-kc100-bac4641bf1cd
@@ -94,12 +95,6 @@ export interface KasaPart {
     body: Buffer;
 }
 
-// Camera quirk: the Basic auth password must itself be base64(plaintext) before the standard
-// Basic auth base64(user:pass) wrapping. Username is the plaintext Kasa account email.
-function encodeKasaPassword(plaintext: string) {
-    return Buffer.from(plaintext, 'utf8').toString('base64');
-}
-
 // A still JPEG served by the stream server alongside the live stream; the one-connection limit
 // applies to /https/stream/mixed only, so this works while the stream is being watched. The
 // firmware copies a fixed 640x360 frame and reads no query parameters, so there is no way to ask
@@ -119,8 +114,12 @@ export class KasaSnapshotError extends Error {
 }
 
 export async function fetchKasaSnapshot(options: KasaConnectOptions): Promise<Buffer> {
-    const auth =
-        'Basic ' + Buffer.from(`${options.username}:${encodeKasaPassword(options.password)}`).toString('base64');
+    const auth = kasaStreamAuth(options.username, options.password);
+    // Snapshots go through Node's default agent, which keeps the connection for the next one.
+    return retryStaleSocketOnce(() => sendSnapshotRequest(options, auth));
+}
+
+function sendSnapshotRequest(options: KasaConnectOptions, auth: string): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
         const req = https.request(
             {
@@ -164,7 +163,7 @@ export async function fetchKasaSnapshot(options: KasaConnectOptions): Promise<Bu
         req.setTimeout(KASA_SNAPSHOT_TIMEOUT_MS, () => {
             req.destroy(new KasaSnapshotError(`kasa snapshot timeout after ${KASA_SNAPSHOT_TIMEOUT_MS}ms`));
         });
-        req.on('error', reject);
+        req.on('error', e => reject(markStaleSocket(req, e)));
         req.end();
     });
 }
@@ -178,8 +177,7 @@ export class KasaClient {
         // Pre-emptive Basic auth — the camera doesn't send a 401 challenge before serving
         // the multipart stream; the very first request must already include credentials.
         // (No need for the auth-fetch challenge/retry dance other endpoints use.)
-        const auth =
-            'Basic ' + Buffer.from(`${options.username}:${encodeKasaPassword(options.password)}`).toString('base64');
+        const auth = kasaStreamAuth(options.username, options.password);
 
         // Cameras present a self-signed cert. The body is consumed as a long-lived stream
         // rather than buffered to completion, so we don't read the response body here.
@@ -190,6 +188,10 @@ export class KasaClient {
                     port,
                     method: 'GET',
                     path: KASA_STREAM_PATH,
+                    // Its own connection, never one from the default agent's pool: a snapshot
+                    // leaves a kept-alive socket to this same port there, and if the camera has
+                    // since closed it the stream request would fail on it.
+                    agent: false,
                     rejectUnauthorized: false,
                     headers: {
                         Authorization: auth,
