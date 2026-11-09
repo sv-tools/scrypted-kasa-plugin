@@ -71,7 +71,7 @@ The intercom ffmpeg invocation in `KasaCamera.startIntercom` carries a deliberat
 
 ### IOT device polling
 
-`KasaIotDevice` drives a 30 s `refreshState` poll (`src/iot/device.ts`) so external state changes (Kasa app, physical button) eventually reach Scrypted/HomeKit. Per-instance jitter on the first poll spreads load when many devices boot together. `refreshInFlight` shares overlapping calls — opening parallel TCP sockets to the same plug occasionally races. The same in-flight-promise pattern is used for `emeterRealtime` (5 s cache), `KasaCamera.refreshChildDevices`, and `KasaPlugin.refreshAllDevices` — reuse it for any new operation that could be triggered concurrently.
+`KasaIotBase` (`src/iot/base.ts`), the parent of the relay devices (`KasaIotDevice`) and `KasaBulb`, drives a 30 s `refreshState` poll so external state changes (Kasa app, physical button) eventually reach Scrypted/HomeKit. The poll writes a property only when its value changed (`update()`): every assignment is an RPC and makes the server re-save the device. Per-instance jitter on the first poll spreads load when many devices boot together. `refreshInFlight` shares overlapping calls — opening parallel TCP sockets to the same plug occasionally races. The same in-flight-promise pattern is used for `emeterRealtime` (5 s cache), `KasaCamera.refreshChildDevices`, and `KasaPlugin.refreshAllDevices` — reuse it for any new operation that could be triggered concurrently.
 
 `device.release()` (called from `KasaPlugin.releaseDevice`) clears the poll timers — keep new background timers off the device unless `release()` learns to clear them, otherwise removing a device leaks intervals.
 

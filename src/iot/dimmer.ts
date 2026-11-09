@@ -14,6 +14,6 @@ export class KasaDimmer extends KasaIotDevice implements Brightness {
     }
 
     protected onSysInfo(sys: Record<string, any>): void {
-        if (typeof sys.brightness === 'number') this.brightness = sys.brightness;
+        if (typeof sys.brightness === 'number') this.update('brightness', sys.brightness);
     }
 }
