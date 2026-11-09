@@ -102,8 +102,9 @@ Tested camera models: KD110, KC200, KC401, KC420WS, EC71.
      After the first camera is configured these are pre-populated from any other Kasa
      camera in Scrypted.
 
-Adopted devices get their IP, port, name, model, MAC, serial number, and firmware version
-populated automatically. The manufacturer is reported as `TP-Link Kasa`.
+Adopted devices get their IP, port, name, model, MAC, serial number, hardware version, and
+firmware version populated automatically (HomeKit shows the hardware version as Hardware
+Revision). The manufacturer is reported as `TP-Link Kasa`.
 
 Discovery sends a single UDP/9999 burst on each connected /24:
 
