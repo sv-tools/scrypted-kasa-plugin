@@ -63,6 +63,15 @@ const CAMERA_OFF_POLL_MS = 5_000;
 // The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
 class CameraOffError extends Error {}
 
+function formatDuration(ms: number): string {
+    const min = Math.floor(ms / 60_000);
+    if (min < 1) return 'less than a minute';
+    if (min < 60) return `${min} min`;
+    const h = Math.floor(min / 60);
+    if (h < 48) return `${h} h ${min % 60} min`;
+    return `${Math.floor(h / 24)} days`;
+}
+
 function isConnectionRefused(e: Error): boolean {
     return (e as NodeJS.ErrnoException).code === 'ECONNREFUSED' || /\bECONNREFUSED\b/.test(e.message);
 }
@@ -270,6 +279,7 @@ class KasaCamera
     // recovery message, and the auto-reboot grace period.
     private streamDownSince?: number;
     private lastAutoRebootAt = 0;
+    private streamStatus?: { state: 'active' | 'down' | 'off'; since: number; detail?: string };
     // Kill switches for any in-flight video streams. Stored so we can tear them down when
     // the user changes network/auth settings — otherwise the existing TCP connection keeps
     // talking to the old IP and clients see "phantom" video from a stale endpoint.
@@ -311,6 +321,36 @@ class KasaCamera
     private getPrivacy(): KasaCameraPrivacy {
         if (!this.privacy) this.privacy = new KasaCameraPrivacy(this, this.privacyNativeId);
         return this.privacy;
+    }
+
+    // Shown as the read-only "Video stream" setting. It can't be the Online interface: the
+    // rebroadcast mixin claims Online above us, the server only keeps the topmost implementer's
+    // value, and that mixin never sets it false for a single-stream camera, so a camera whose
+    // stream server died still read as online. Only the stream attempt knows, so it records this.
+    private setStreamStatus(state: 'active' | 'down' | 'off', detail?: string): void {
+        const prev = this.streamStatus;
+        if (prev?.state === state && prev.detail === detail) return;
+        this.streamStatus = { state, detail, since: prev?.state === state ? prev.since : Date.now() };
+        // Refreshes the settings page if it is open. (The Readme card can't be used for this:
+        // the UI fetches it once per page and doesn't listen for events.)
+        this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+    }
+
+    // The value is a single-line text field that the UI clips, so it carries only the state and
+    // duration; the reason goes in the description, which wraps.
+    private describeStreamStatus(): { value: string; description: string } {
+        const s = this.streamStatus;
+        if (!s) return { value: 'Not connected yet', description: 'No stream attempt since the plugin started.' };
+        // Relative time: the server's clock is often UTC in a container, so a wall time would mislead.
+        const ago = formatDuration(Date.now() - s.since);
+        if (s.state === 'active')
+            return { value: `Active for ${ago}`, description: 'The latest connection to the video stream succeeded.' };
+        if (s.state === 'off')
+            return { value: `Off for ${ago}`, description: 'The camera is turned off (Privacy Mode).' };
+        return {
+            value: `Down for ${ago}`,
+            description: s.detail || 'The latest connection to the video stream failed.',
+        };
     }
 
     // Shared in-flight promise so concurrent triggers (constructor, putSetting,
@@ -460,6 +500,13 @@ class KasaCamera
 
     async getSettings(): Promise<Setting[]> {
         return [
+            {
+                key: 'streamStatus',
+                title: 'Video stream',
+                type: 'string',
+                readonly: true,
+                ...this.describeStreamStatus(),
+            },
             ...(await this.storageSettings.getSettings()),
             {
                 key: 'reboot',
@@ -711,10 +758,19 @@ class KasaCamera
                 });
             } catch (e) {
                 const err = await this.explainStreamError(e as Error);
+                if (err instanceof CameraOffError) this.setStreamStatus('off');
+                // A replaced error means explainStreamServerDown confirmed the dead stream server.
+                else if (err !== e)
+                    this.setStreamStatus(
+                        'down',
+                        'The camera refuses video connections but still answers controls; its stream server has stopped. Press Reboot camera below.',
+                    );
+                else this.setStreamStatus('down', err.message);
                 if (!(err instanceof CameraOffError) || attempt >= 1 || !(await this.waitForCameraOn(holdDeadline)))
                     throw err;
             }
         }
+        this.setStreamStatus('active');
         if (this.streamDownSince !== undefined) {
             this.console.log(`video stream is back after ${Math.round((Date.now() - this.streamDownSince) / 1000)} s`);
             this.streamDownSince = undefined;
