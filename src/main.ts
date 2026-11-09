@@ -1,5 +1,6 @@
 import sdk, {
     AdoptDevice,
+    Camera,
     Device,
     DeviceCreator,
     DeviceCreatorSettings,
@@ -9,13 +10,16 @@ import sdk, {
     FFmpegInput,
     Intercom,
     MediaObject,
+    MotionSensor,
     OnOff,
     PanTiltZoom,
     PanTiltZoomCommand,
     PanTiltZoomMovement,
     Readme,
     RequestMediaStreamOptions,
+    RequestPictureOptions,
     ResponseMediaStreamOptions,
+    ResponsePictureOptions,
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
@@ -29,9 +33,9 @@ import sdk, {
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import child_process, { ChildProcess } from 'child_process';
 import { randomBytes } from 'crypto';
-import { KASA_DEFAULT_PORT, KasaClient } from './camera/api';
+import { fetchKasaSnapshot, KASA_DEFAULT_PORT, KasaClient, KasaSnapshotError } from './camera/api';
 import { KASA_TALK_PORT, KasaTalkSession } from './camera/intercom';
-import { KasaLinkieClient, KasaPtzDirection } from './camera/linkie';
+import { KASA_LINKIE_CAMERA_OFF, KasaLinkieClient, KasaLinkieError, KasaPtzDirection } from './camera/linkie';
 import { KasaStreamHandle, registerLiveCleanup, spawnKasaStream } from './camera/stream';
 import { KasaBulb } from './iot/bulb';
 import { KasaDimmer } from './iot/dimmer';
@@ -63,6 +67,17 @@ const CAMERA_OFF_POLL_MS = 5_000;
 // app). Stream attempts also notice, but HomeKit stops requesting streams from a camera it
 // shows as off, so without this it could stay off in the Home app indefinitely.
 const PRIVACY_POLL_MS = 60_000;
+
+// Camera motion events (the "Motion events from camera" setting). The camera has no push, so
+// its motion state is polled; one call takes ~30 ms on the kept-alive connection.
+const MOTION_POLL_MS = 1_000;
+// is_moving drops ~2 s after the camera's last alarm, so a person standing still flickers it.
+// Hold motionDetected on this long after the last true, so HomeKit sees one event per visit.
+const MOTION_HOLD_MS = 10_000;
+// Failed polls back off from MOTION_POLL_MS up to this, so an unreachable camera isn't hammered.
+const MOTION_POLL_MAX_BACKOFF_MS = 30_000;
+// While the camera is off (Privacy Mode) it detects nothing; check back at this pace.
+const MOTION_POLL_PRIVACY_MS = 5_000;
 
 // The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
 class CameraOffError extends Error {}
@@ -270,7 +285,17 @@ function kasaPtzSpeed(v: number): number {
 
 class KasaCamera
     extends ScryptedDeviceBase
-    implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, PanTiltZoom, PrivacyMode, Readme
+    implements
+        VideoCamera,
+        Camera,
+        MotionSensor,
+        Settings,
+        Intercom,
+        DeviceProvider,
+        OnOff,
+        PanTiltZoom,
+        PrivacyMode,
+        Readme
 {
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
@@ -299,6 +324,13 @@ class KasaCamera
     // the user changes network/auth settings — otherwise the existing TCP connection keeps
     // talking to the old IP and clients see "phantom" video from a stale endpoint.
     private activeStreamKills = new Set<Deferred<void>>();
+    // Camera motion polling: the pending poll timer, the timer that clears motionDetected after
+    // the hold, and the current backoff after failed polls.
+    private motionPoll?: NodeJS.Timeout;
+    private motionPolling = false;
+    private motionHoldTimer?: NodeJS.Timeout;
+    private motionPollBackoffMs = MOTION_POLL_MS;
+    private motionPollFailing = false;
 
     constructor(nativeId: string) {
         super(nativeId);
@@ -308,7 +340,13 @@ class KasaCamera
             // Resume watching for the camera coming back on even if the probe below can't reach
             // it; otherwise a persisted "off" would stay off in HomeKit indefinitely.
             if (this.privacyMode) this.setPrivacyPoll(true);
-            this.refreshChildDevices().catch(e => this.console.warn('refreshChildDevices failed', e));
+            // Motion can start now; only publishing interfaces has to wait for the refresh below.
+            if (this.storageSettings.values.cameraMotion) this.startMotionPoll();
+            // After the refresh, which re-publishes providedInterfaces from its own snapshot and
+            // would undo an interface change made while it ran.
+            this.refreshChildDevices()
+                .catch(e => this.console.warn('refreshChildDevices failed', e))
+                .finally(() => this.applyCameraFeatures());
         });
     }
 
@@ -319,6 +357,8 @@ class KasaCamera
         // on its own fixed port (10443) which the client supplies as a default.
         const c = this.cachedLinkie;
         if (c && c.ip === ip && c.username === username && c.password === password) return c.client;
+        // The old client's kept-alive socket points at the old endpoint or credentials.
+        c?.client.destroy();
         const client = new KasaLinkieClient({ ip, username, password }, this.console);
         this.cachedLinkie = { client, ip, username, password };
         return client;
@@ -432,6 +472,146 @@ class KasaCamera
         // A stream attempt may be parked waiting for the camera to come back on; let it
         // connect now instead of at its next poll.
         if (!privacyMode) this.wakeCameraOffWaiters();
+    }
+
+    // The two opt-in camera features. Each is published as an interface only while its setting is
+    // on: Camera makes the Snapshot plugin take pictures from the camera instead of decoding a
+    // prebuffer frame, and MotionSensor is where Video Analysis and HomeKit read motion from.
+    private async applyCameraFeatures(): Promise<void> {
+        const { cameraMotion, cameraSnapshots } = this.storageSettings.values;
+        // Stop before unpublishing MotionSensor: clearing motionDetected afterwards would be
+        // rejected for an interface the device no longer implements.
+        if (cameraMotion) this.startMotionPoll();
+        else this.stopMotionPoll();
+
+        const state = deviceManager.getDeviceState(this.nativeId);
+        if (!state || !this.nativeId) return;
+        const provided = state.providedInterfaces || [];
+        const optional: string[] = [ScryptedInterface.Camera, ScryptedInterface.MotionSensor];
+        const want = provided.filter(i => !optional.includes(i));
+        if (cameraSnapshots) want.push(ScryptedInterface.Camera);
+        if (cameraMotion) want.push(ScryptedInterface.MotionSensor);
+        if (want.length === provided.length && want.every(i => provided.includes(i))) return;
+        await deviceManager.onDeviceDiscovered({
+            nativeId: this.nativeId,
+            name: state.name || this.nativeId,
+            type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
+            interfaces: want,
+            info: state.info,
+            room: state.room || undefined,
+        });
+    }
+
+    // Bumped on every start/stop, so a poll that was in flight across one doesn't act on a
+    // stopped loop or start a second one.
+    private motionPollGeneration = 0;
+
+    private startMotionPoll(): void {
+        if (this.motionPolling || this.released) return;
+        this.motionPolling = true;
+        this.motionPollGeneration++;
+        this.motionPollBackoffMs = MOTION_POLL_MS;
+        // A true left in the device state (from before a restart, or by a removed Video Analysis
+        // mixin) would otherwise stick until the camera's next detection. Unconditional: a value
+        // a mixin wrote isn't in this plugin's copy of the state, so a `!== false` check misses it.
+        this.motionDetected = false;
+        this.scheduleMotionPoll(0);
+    }
+
+    private stopMotionPoll(): void {
+        if (!this.motionPolling) return;
+        this.motionPolling = false;
+        this.motionPollGeneration++;
+        clearTimeout(this.motionPoll);
+        this.motionPoll = undefined;
+        this.clearMotion();
+    }
+
+    private clearMotion(): void {
+        clearTimeout(this.motionHoldTimer);
+        this.motionHoldTimer = undefined;
+        if (this.motionDetected) this.motionDetected = false;
+    }
+
+    private scheduleMotionPoll(delayMs: number): void {
+        const generation = this.motionPollGeneration;
+        this.motionPoll = setTimeout(() => {
+            this.motionPoll = undefined;
+            if (generation === this.motionPollGeneration) this.pollMotion(generation);
+        }, delayMs);
+    }
+
+    private async pollMotion(generation: number): Promise<void> {
+        const { ip, username, password } = this.storageSettings.values;
+        // A camera that is off detects nothing, and a manually added one may lack credentials.
+        if (this.privacyMode || !ip || !username || !password) {
+            this.clearMotion();
+            this.scheduleMotionPoll(MOTION_POLL_PRIVACY_MS);
+            return;
+        }
+        let delay = MOTION_POLL_MS;
+        try {
+            const moving = await this.linkie().getMotionDetected();
+            if (generation !== this.motionPollGeneration) return;
+            if (this.motionPollFailing) {
+                this.motionPollFailing = false;
+                this.console.log('camera motion polling recovered');
+            }
+            this.motionPollBackoffMs = MOTION_POLL_MS;
+            if (moving) this.onCameraMotion();
+        } catch (e) {
+            if (generation !== this.motionPollGeneration) return;
+            if (e instanceof KasaLinkieError && e.errCode === KASA_LINKIE_CAMERA_OFF) {
+                // Turned off outside the plugin; Privacy Mode catches up through its own poll.
+                this.clearMotion();
+                delay = MOTION_POLL_PRIVACY_MS;
+            } else {
+                // Logged once per outage: at one poll a second, every failure would flood the console.
+                if (!this.motionPollFailing) {
+                    this.motionPollFailing = true;
+                    this.console.warn('camera motion poll failed, retrying with backoff:', (e as Error).message);
+                }
+                delay = this.motionPollBackoffMs;
+                this.motionPollBackoffMs = Math.min(this.motionPollBackoffMs * 2, MOTION_POLL_MAX_BACKOFF_MS);
+            }
+        }
+        this.scheduleMotionPoll(delay);
+    }
+
+    // The camera's start and end are logged: a Video Analysis mixin in Replace mode hides this
+    // device's motionDetected behind its own, so the console is where the camera's shows.
+    private onCameraMotion(): void {
+        if (!this.motionDetected) {
+            this.console.log('camera motion started');
+            this.motionDetected = true;
+        }
+        clearTimeout(this.motionHoldTimer);
+        this.motionHoldTimer = setTimeout(() => {
+            this.motionHoldTimer = undefined;
+            if (this.motionPolling && this.motionDetected) {
+                this.console.log('camera motion ended');
+                this.motionDetected = false;
+            }
+        }, MOTION_HOLD_MS);
+    }
+
+    // Camera interface, published only while "Snapshots from camera" is on.
+    async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
+        // The camera answers 503 when it's off; skip the round trip.
+        if (this.privacyMode) throw new Error('Kasa camera is turned off (privacy mode)');
+        const { ip, port, username, password } = this.storageSettings.values;
+        const jpeg = await fetchKasaSnapshot({ ip, port, username, password }).catch((e: Error) => {
+            // Turned off outside the plugin (Kasa app) since Privacy Mode last synced.
+            if (e instanceof KasaSnapshotError && e.statusCode === 503) return undefined;
+            throw e;
+        });
+        if (!jpeg) throw new Error('Kasa camera is turned off (privacy mode)');
+        return mediaManager.createMediaObject(jpeg, 'image/jpeg');
+    }
+
+    async getPictureOptions(): Promise<ResponsePictureOptions[]> {
+        // The camera serves one fixed 640x360 JPEG; it takes no size or channel options.
+        return [{ id: 'snapshot', name: 'Camera Snapshot', picture: { width: 640, height: 360 } }];
     }
 
     // Shared in-flight promise so concurrent triggers (constructor, putSetting,
@@ -595,6 +775,26 @@ class KasaCamera
                 `${STREAM_DOWN_REBOOT_AFTER_MS / 60_000} minutes while it still answers controls. ` +
                 `At most once every ${AUTO_REBOOT_COOLDOWN_MS / 60_000} minutes.`,
         },
+        cameraMotion: {
+            title: 'Motion events from camera',
+            type: 'boolean',
+            defaultValue: false,
+            description:
+                "Use the camera's own motion detection as this device's motion sensor, read over the local " +
+                'network once a second. No video is decoded on the server. Sensitivity and zones come from ' +
+                'the Kasa app. Person detection and a doorbell ring also count as motion. If Video Analysis ' +
+                'runs on this camera, its Built-In Motion Sensor option decides which one wins (Replace, the ' +
+                "default, ignores the camera's).",
+        },
+        cameraSnapshots: {
+            title: 'Snapshots from camera',
+            type: 'boolean',
+            defaultValue: false,
+            description:
+                'Take snapshots from the camera (a 640x360 JPEG in about half a second) instead of decoding ' +
+                'a frame from the video stream. For full-resolution snapshots, leave this off or set the ' +
+                'Snapshot plugin option Snapshots from Prebuffer to Enabled.',
+        },
     });
 
     async getSettings(): Promise<Setting[]> {
@@ -645,13 +845,14 @@ class KasaCamera
             '',
             '## Endpoints',
             '',
-            'The plugin talks to the camera over three separate HTTPS endpoints. The talk and',
-            'control endpoints are fixed in the camera firmware; the stream port can be edited',
-            "in the camera's Settings tab if needed:",
+            'The plugin talks to the camera over HTTPS on three ports. The talk and control',
+            'ports are fixed in the camera firmware; the stream port can be edited in the',
+            "camera's Settings tab if needed:",
             '',
             '```',
             renderKv([
                 ['Stream', `https://${ipLine}:${streamPort}/https/stream/mixed`],
+                ['Snapshot', `https://${ipLine}:${streamPort}/https/stream/snapshot.jpg`],
                 ['Talk', `https://${ipLine}:${KASA_TALK_PORT}/https/speaker/audio/g711block`],
                 ['Control', `https://${ipLine}:10443/data/LINKIE2.json`],
             ]),
@@ -670,6 +871,10 @@ class KasaCamera
             return;
         }
         await this.storageSettings.putSetting(key, value);
+        if (key === 'cameraMotion' || key === 'cameraSnapshots') {
+            await this.applyCameraFeatures();
+            return;
+        }
         if (key === 'ip' || key === 'port' || key === 'username' || key === 'password') {
             // Tear down active streams + intercom — they're holding TCP sockets to the old
             // endpoint, which keeps delivering frames from the wrong camera until something
@@ -1122,6 +1327,14 @@ class KasaCamera
         this.released = true;
         if (this.privacyPoll) clearInterval(this.privacyPoll);
         this.privacyPoll = undefined;
+        // Stop polling without stopMotionPoll(): the device is going away, so don't publish a
+        // final motionDetected write.
+        this.motionPolling = false;
+        this.motionPollGeneration++;
+        clearTimeout(this.motionPoll);
+        clearTimeout(this.motionHoldTimer);
+        this.cachedLinkie?.client.destroy();
+        this.cachedLinkie = undefined;
     }
 }
 

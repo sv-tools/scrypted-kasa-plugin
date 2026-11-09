@@ -100,6 +100,75 @@ function encodeKasaPassword(plaintext: string) {
     return Buffer.from(plaintext, 'utf8').toString('base64');
 }
 
+// A still JPEG served by the stream server alongside the live stream; the one-connection limit
+// applies to /https/stream/mixed only, so this works while the stream is being watched. The
+// firmware copies a fixed 640x360 frame and reads no query parameters, so there is no way to ask
+// for a larger one. A camera that is turned off (Privacy Mode) answers HTTP 503.
+export const KASA_SNAPSHOT_PATH = '/https/stream/snapshot.jpg';
+const KASA_SNAPSHOT_TIMEOUT_MS = 10000;
+// A real snapshot is ~60-110 KB; anything far larger isn't one.
+const KASA_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024;
+
+export class KasaSnapshotError extends Error {
+    constructor(
+        message: string,
+        public statusCode?: number,
+    ) {
+        super(message);
+    }
+}
+
+export async function fetchKasaSnapshot(options: KasaConnectOptions): Promise<Buffer> {
+    const auth =
+        'Basic ' + Buffer.from(`${options.username}:${encodeKasaPassword(options.password)}`).toString('base64');
+    return new Promise<Buffer>((resolve, reject) => {
+        const req = https.request(
+            {
+                host: options.ip,
+                port: options.port || KASA_DEFAULT_PORT,
+                method: 'GET',
+                path: KASA_SNAPSHOT_PATH,
+                rejectUnauthorized: false,
+                headers: { Authorization: auth, Accept: 'image/*' },
+            },
+            res => {
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    reject(new KasaSnapshotError(`kasa snapshot HTTP ${res.statusCode}`, res.statusCode));
+                    return;
+                }
+                const chunks: Buffer[] = [];
+                let size = 0;
+                res.on('data', (c: Buffer) => {
+                    size += c.length;
+                    if (size > KASA_SNAPSHOT_MAX_BYTES) {
+                        req.destroy(
+                            new KasaSnapshotError(`kasa snapshot larger than ${KASA_SNAPSHOT_MAX_BYTES} bytes`),
+                        );
+                        return;
+                    }
+                    chunks.push(c);
+                });
+                res.on('end', () => {
+                    const body = Buffer.concat(chunks);
+                    // JPEG SOI marker; the camera labels it image/jpg, so don't trust the header.
+                    if (body.length < 2 || body[0] !== 0xff || body[1] !== 0xd8) {
+                        reject(new KasaSnapshotError('kasa snapshot is not a JPEG'));
+                        return;
+                    }
+                    resolve(body);
+                });
+                res.on('error', reject);
+            },
+        );
+        req.setTimeout(KASA_SNAPSHOT_TIMEOUT_MS, () => {
+            req.destroy(new KasaSnapshotError(`kasa snapshot timeout after ${KASA_SNAPSHOT_TIMEOUT_MS}ms`));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 export class KasaClient {
     body!: IncomingMessage;
     boundary!: string;
