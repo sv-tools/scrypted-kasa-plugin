@@ -134,6 +134,7 @@ export abstract class KasaIotDevice extends ScryptedDeviceBase implements OnOff,
             '```',
             renderKv([
                 ['Model', info.model || '?'],
+                ['Hardware', info.version || '?'],
                 ['Firmware', info.firmware || '?'],
                 ['MAC', formatKasaMac(info.mac)],
                 ['IP', ip],
