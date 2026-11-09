@@ -39,7 +39,7 @@ Single Scrypted plugin (`KasaPlugin`) that adopts two unrelated TP-Link Kasa dev
 
 `classifyKasa()` (in `main.ts`) only returns the four families auto-discovery can detect from sysinfo; `'dimmer'` is added later by `adoptIotDevice()` when the device exposes brightness, and the manual "Add device" dialog can persist any of the five.
 
-Camera child devices (spotlight, siren, privacy) use suffixed nativeIds (`<camera-id>-spotlight`, `-siren`, `-privacy`). Anywhere we walk `getNativeIds()` (refresh, migrations, inventory), filter these out with `isCameraChildNativeId()` — they share the parent's sysinfo and would otherwise be re-published or double-counted. A new child type must add its suffix to `CAMERA_CHILD_SUFFIXES`.
+Camera child devices (spotlight, siren, privacy) use suffixed nativeIds (`<camera-id>-spotlight`, `-siren`, `-privacy`). Anywhere we walk `getNativeIds()` (refresh, migrations, inventory), filter these out with `isCameraChildNativeId()` — they share the parent's sysinfo and would otherwise be re-published or double-counted. The children are rows of the `CAMERA_CHILDREN` table (suffix, label, device type, how to switch it), all served by one `KasaCameraChild` class; a new child type is a new row plus its probe in `refreshChildDevicesInternal`, and `isCameraChildNativeId()` picks up the suffix from the table.
 
 ### Stream lifecycle and cleanup (cameras)
 
@@ -86,5 +86,8 @@ Empty-string `room` clears an existing room assignment in `onDeviceDiscovered`; 
 - `any` is allowed for Kasa sysinfo (the JSON shape varies per device family) and narrow runtime-tag casts (`kasaClass`). The ESLint config disables `@typescript-eslint/no-explicit-any` deliberately.
 - Empty `catch {}` blocks are a deliberate teardown idiom (`try { socket.close(); } catch {}`) — `no-empty` is configured to allow them.
 - `_`-prefixed args/vars are intentionally unused.
+- An operation that can be triggered concurrently (a constructor, a settings change, a button pressed twice) is wrapped in `singleFlight()` (`src/shared/single-flight.ts`) so overlapping calls share one run.
+- Re-publish an existing device through `republishDevice()` in `main.ts`; it starts from `providedInterfaces` and leaves the room alone.
+- `iotDeviceShape()` decides the Scrypted type, interfaces and `kasaClass` of a plug/switch/dimmer/bulb for the discovery list, adoption and manual creation alike; `CAMERA_INTERFACES` does the same for cameras.
 - Comments in this codebase explain *why* (hidden constraints, protocol quirks, prior incidents). Don't strip them. New comments should follow the same bar — a load-bearing reason, not a description of what the next line does.
 - Commits: use `Assisted-by:` trailer (not `Co-Authored-By:`) and always sign off with `git commit -s`.

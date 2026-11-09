@@ -44,6 +44,7 @@ import { KASA_IOT_PORT } from './iot/protocol';
 import { KasaSwitch } from './iot/switch';
 import { discoverKasa, KasaDiscoveredDevice } from './shared/discovery';
 import { formatKasaMac, renderKv } from './shared/readme';
+import { singleFlight } from './shared/single-flight';
 
 // Stream-server-down handling (see KasaCamera.explainStreamServerDown).
 // Ceiling for any hold inside getVideoStream. The objectdetector plugin ends a Video Analysis
@@ -79,8 +80,26 @@ const MOTION_POLL_MAX_BACKOFF_MS = 30_000;
 // While the camera is off (Privacy Mode) it detects nothing; check back at this pace.
 const MOTION_POLL_PRIVACY_MS = 5_000;
 
-// The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
-class CameraOffError extends Error {}
+// The error for a camera turned off in Privacy Mode; getVideoStream holds on it.
+class CameraOffError extends Error {
+    constructor() {
+        super('Kasa camera is turned off (privacy mode)');
+        // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
+        this.stack = this.message;
+    }
+}
+
+// The stream error for a camera whose stream server has stopped while its control plane still
+// answers (see KasaCamera.explainStreamServerDown).
+class StreamServerDownError extends Error {
+    constructor() {
+        super('Kasa camera video stream is down (connection refused)');
+        // Drop the stack: the state is logged once when it starts, and this on every retry.
+        this.stack = this.message;
+    }
+}
+
+const KASA_MANUFACTURER = 'TP-Link Kasa';
 
 function formatDuration(ms: number): string {
     const min = Math.floor(ms / 60_000);
@@ -117,21 +136,12 @@ const KASA_CAMERA_TYPES = new Set(['IOT.IPCAMERA']);
 // camera streaming: any teardown source resolves it once and every owned resource registers
 // a cleanup against the same promise.
 class Deferred<T> {
-    finished = false;
     resolve!: (value: T) => void;
-    reject!: (error: Error) => void;
     promise: Promise<T>;
 
     constructor() {
-        this.promise = new Promise<T>((resolve, reject) => {
-            this.resolve = v => {
-                this.finished = true;
-                resolve(v);
-            };
-            this.reject = e => {
-                this.finished = true;
-                reject(e);
-            };
+        this.promise = new Promise<T>(resolve => {
+            this.resolve = resolve;
         });
     }
 }
@@ -152,8 +162,8 @@ function classifyKasa(d: KasaDiscoveredDevice): KasaDeviceClass | undefined {
         // `description`. HS200/210/220 are wall-mounted switches; everything else is an
         // outlet. Multi-outlet strips have a `children` array and are skipped — they need
         // per-outlet handling we don't do yet.
-        if (Array.isArray((d.sysinfo as any)?.children) && (d.sysinfo as any).children.length) return undefined;
-        const devName: string = (d.sysinfo as any)?.dev_name || '';
+        if (Array.isArray(d.sysinfo.children) && d.sysinfo.children.length) return undefined;
+        const devName = d.sysinfo.dev_name || '';
         if (/switch|dimmer/i.test(devName)) return 'switch';
         return 'plug';
     }
@@ -161,14 +171,12 @@ function classifyKasa(d: KasaDiscoveredDevice): KasaDeviceClass | undefined {
 }
 
 function isDimmer(d: KasaDiscoveredDevice): boolean {
-    const sys = d.sysinfo as any;
-    if (typeof sys?.brightness === 'number') return true;
-    const feature: string = sys?.feature || '';
-    if (/DIM/.test(feature)) return true;
+    const sys = d.sysinfo;
+    if (typeof sys.brightness === 'number') return true;
+    if (/DIM/.test(sys.feature || '')) return true;
     // KS230 (3-way dimmer) doesn't report `brightness` in sysinfo at idle, and its
     // `feature` string doesn't include DIM either — but `dev_name` always says "Dimmer".
-    const devName: string = sys?.dev_name || '';
-    return /dimmer/i.test(devName);
+    return /dimmer/i.test(sys.dev_name || '');
 }
 
 interface BulbCapabilities {
@@ -177,14 +185,80 @@ interface BulbCapabilities {
 }
 
 function bulbCapabilities(d: KasaDiscoveredDevice): BulbCapabilities {
-    const sys = d.sysinfo as any;
     return {
-        isColor: sys?.is_color === 1,
-        isVariableColorTemp: sys?.is_variable_color_temp === 1,
+        isColor: d.sysinfo.is_color === 1,
+        isVariableColorTemp: d.sysinfo.is_variable_color_temp === 1,
+    };
+}
+
+// Interfaces every camera is published with. PanTiltZoom, PrivacyMode, Camera and MotionSensor
+// are added later, per camera, when it has the feature or the user turns it on.
+const CAMERA_INTERFACES = [
+    ScryptedInterface.VideoCamera,
+    ScryptedInterface.Settings,
+    ScryptedInterface.Intercom,
+    // Required so Scrypted routes child-device lookups (e.g. the spotlight) through
+    // KasaCamera.getDevice rather than treating the camera as a leaf.
+    ScryptedInterface.DeviceProvider,
+    // OnOff drives the camera's status LED — HomeKit binds its CameraOperatingModeIndicator
+    // characteristic to this.
+    ScryptedInterface.OnOff,
+    ScryptedInterface.Readme,
+];
+
+// How a plug, switch, dimmer or bulb is published, and the kasaClass marker stored for it.
+// One place decides this for the discovery list, adoption and the manual "Add device" dialog,
+// so what the list shows is what adoption creates. `device` is the discovery reply, when there
+// is one; a manually added device gets only what its chosen class implies.
+function iotDeviceShape(
+    cls: Exclude<KasaDeviceClass, 'camera'>,
+    device?: KasaDiscoveredDevice,
+): { kasaClass: KasaDeviceClass; type: ScryptedDeviceType; interfaces: ScryptedInterface[] } {
+    const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings, ScryptedInterface.Readme];
+    if (cls === 'bulb') {
+        interfaces.push(ScryptedInterface.Brightness);
+        // Color support comes from sysinfo, so a manually added bulb starts with brightness
+        // only; re-discovering it detects the rest.
+        const caps = device && bulbCapabilities(device);
+        if (caps?.isColor) interfaces.push(ScryptedInterface.ColorSettingHsv);
+        if (caps?.isVariableColorTemp) interfaces.push(ScryptedInterface.ColorSettingTemperature);
+        return { kasaClass: 'bulb', type: ScryptedDeviceType.Light, interfaces };
+    }
+    // A dimmer plug or switch (HS220, KS230, ...) is almost always wired to a light, so it is
+    // exposed as a Light, like a bulb; the stored class is what tells the two apart.
+    if (cls === 'dimmer' || (device && isDimmer(device))) {
+        interfaces.push(ScryptedInterface.Brightness);
+        return { kasaClass: 'dimmer', type: ScryptedDeviceType.Light, interfaces };
+    }
+    return {
+        kasaClass: cls,
+        type: cls === 'switch' ? ScryptedDeviceType.Switch : ScryptedDeviceType.Outlet,
+        interfaces,
     };
 }
 
 const { deviceManager, mediaManager, systemManager } = sdk;
+
+// Re-publishes an existing device with a changed interface list and/or info, keeping the rest.
+// The list a caller builds must start from state.providedInterfaces, which is what this
+// plugin registered; state.interfaces also holds mixin-provided ones (HomeKit, NVR, ...), and
+// passing those back would claim them as ours.
+async function republishDevice(
+    nativeId: ScryptedNativeId,
+    changes: { interfaces?: string[]; info?: Device['info'] },
+): Promise<void> {
+    const state = nativeId && deviceManager.getDeviceState(nativeId);
+    if (!state) return;
+    await deviceManager.onDeviceDiscovered({
+        nativeId,
+        name: state.name || nativeId,
+        type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
+        interfaces: changes.interfaces ?? state.providedInterfaces ?? [],
+        info: changes.info ?? state.info,
+        // An empty string would clear the room; undefined leaves it alone.
+        room: state.room || undefined,
+    });
+}
 
 // Walk every known device's state to collect existing room names. Used to populate the room
 // dropdown so the user picks an existing room instead of typing a new one. Cached for 2 s so
@@ -205,76 +279,78 @@ function getKnownRooms(): string[] {
     return out;
 }
 
-// Child device for cameras with a spotlight (e.g. KC420WS — the Kasa app calls this
-// the "spotlight"). Backed by the LINKIE2 `smartlife.cam.ipcamera.dayNight.set_force_lamp_state`
-// command. (The protocol-level name is "force_lamp" — internally the camera firmware
-// treats this as a generic forced-lamp state, but in the user-facing UI it's a spotlight.)
-class KasaCameraSpotlight extends ScryptedDeviceBase implements OnOff {
-    constructor(
-        public camera: KasaCamera,
-        nativeId: string,
-    ) {
-        super(nativeId);
-    }
-
-    async turnOn(): Promise<void> {
-        await this.camera.linkie().setForceLampState(true);
-        this.on = true;
-    }
-
-    async turnOff(): Promise<void> {
-        await this.camera.linkie().setForceLampState(false);
-        this.on = false;
-    }
+// The on/off child devices a camera can have. Each is published only when the camera answers
+// the matching LINKIE2 probe, under the camera's nativeId plus the suffix.
+interface CameraChildSpec {
+    suffix: string;
+    // Appended to the camera's name.
+    label: string;
+    type: ScryptedDeviceType;
+    set(camera: KasaCamera, on: boolean): Promise<void>;
+    // True when `set` writes the child's `on` itself, so the child must not.
+    setsOwnState?: boolean;
 }
 
-// Child device for the siren. Backed by smartlife.cam.ipcamera.siren.set_state. The
-// camera auto-stops after the duration set in the Kasa app (default 30 s), so the `on`
-// state shown in Scrypted may not reflect that auto-off until something polls again.
-class KasaCameraSiren extends ScryptedDeviceBase implements OnOff {
+const CAMERA_CHILDREN = {
+    // The Kasa app calls this the "spotlight" (e.g. KC420WS). At the protocol level it is
+    // dayNight.set_force_lamp_state: the firmware treats it as a generic forced-lamp state.
+    spotlight: {
+        suffix: '-spotlight',
+        label: 'Spotlight',
+        type: ScryptedDeviceType.Light,
+        set: (camera, on) => camera.linkie().setForceLampState(on),
+    },
+    // The camera auto-stops the siren after the duration set in the Kasa app (default 30 s),
+    // so the `on` shown in Scrypted may not reflect that auto-off until something polls again.
+    siren: {
+        suffix: '-siren',
+        label: 'Siren',
+        // HomeKit folds a camera's Light and Siren children into the camera accessory; any
+        // other type is bridged as a standalone accessory.
+        type: ScryptedDeviceType.Siren,
+        set: (camera, on) => camera.linkie().setSirenState(on),
+    },
+    // The camera's own on/off, inverted so it reads naturally in HomeKit automations ("when I
+    // arrive, turn on Kitchen Privacy Mode"): on = camera turned off. It mirrors the camera's
+    // PrivacyMode, which does the work and keeps this child's state in step.
+    privacy: {
+        suffix: '-privacy',
+        label: 'Privacy Mode',
+        type: ScryptedDeviceType.Switch,
+        set: (camera, on) => camera.setPrivacyMode(on),
+        setsOwnState: true,
+    },
+} satisfies Record<string, CameraChildSpec>;
+type CameraChildKind = keyof typeof CAMERA_CHILDREN;
+const CAMERA_CHILD_KINDS = Object.keys(CAMERA_CHILDREN) as CameraChildKind[];
+
+class KasaCameraChild extends ScryptedDeviceBase implements OnOff {
     constructor(
-        public camera: KasaCamera,
+        private camera: KasaCamera,
+        private spec: CameraChildSpec,
         nativeId: string,
     ) {
         super(nativeId);
     }
 
-    async turnOn(): Promise<void> {
-        await this.camera.linkie().setSirenState(true);
-        this.on = true;
+    turnOn(): Promise<void> {
+        return this.set(true);
     }
 
-    async turnOff(): Promise<void> {
-        await this.camera.linkie().setSirenState(false);
-        this.on = false;
-    }
-}
-
-// Child switch for the camera's own on/off, inverted so it reads naturally in HomeKit
-// automations ("when I arrive, turn on Kitchen Privacy Mode"): on = camera turned off.
-// Mirrors the camera's PrivacyMode, which does the work.
-class KasaCameraPrivacy extends ScryptedDeviceBase implements OnOff {
-    constructor(
-        public camera: KasaCamera,
-        nativeId: string,
-    ) {
-        super(nativeId);
+    turnOff(): Promise<void> {
+        return this.set(false);
     }
 
-    async turnOn(): Promise<void> {
-        await this.camera.setPrivacyMode(true);
-    }
-
-    async turnOff(): Promise<void> {
-        await this.camera.setPrivacyMode(false);
+    private async set(on: boolean): Promise<void> {
+        await this.spec.set(this.camera, on);
+        if (!this.spec.setsOwnState) this.on = on;
     }
 }
 
 // Camera child devices share the parent's sysinfo. Anything that walks getNativeIds()
 // (refresh, migrations, inventory) must skip them or they get re-published / double-counted.
-const CAMERA_CHILD_SUFFIXES = ['-spotlight', '-siren', '-privacy'];
 function isCameraChildNativeId(nativeId: string): boolean {
-    return CAMERA_CHILD_SUFFIXES.some(s => nativeId.endsWith(s));
+    return CAMERA_CHILD_KINDS.some(kind => nativeId.endsWith(CAMERA_CHILDREN[kind].suffix));
 }
 
 // Scrypted PTZ magnitudes are -1..1; Kasa's set_move takes a 1..10 step size. Same
@@ -299,9 +375,8 @@ class KasaCamera
 {
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
-    private spotlight?: KasaCameraSpotlight;
-    private siren?: KasaCameraSiren;
-    private privacy?: KasaCameraPrivacy;
+    // Child device objects, created on first use (see child()).
+    private children = new Map<CameraChildKind, KasaCameraChild>();
     // Set while stream attempts are failing because the camera is turned off, so the
     // "turned off" / "back on" transitions are logged once instead of on every retry.
     private cameraOffLogged = false;
@@ -340,8 +415,11 @@ class KasaCamera
             // Resume watching for the camera coming back on even if the probe below can't reach
             // it; otherwise a persisted "off" would stay off in HomeKit indefinitely.
             if (this.privacyMode) this.setPrivacyPoll(true);
-            // Motion can start now; only publishing interfaces has to wait for the refresh below.
-            if (this.storageSettings.values.cameraMotion) this.startMotionPoll();
+            // Motion can start now if MotionSensor is already published, as it is after a restart;
+            // otherwise applyCameraFeatures below publishes it first.
+            const provided = deviceManager.getDeviceState(this.nativeId)?.providedInterfaces;
+            if (this.storageSettings.values.cameraMotion && provided?.includes(ScryptedInterface.MotionSensor))
+                this.startMotionPoll();
             // After the refresh, which re-publishes providedInterfaces from its own snapshot and
             // would undo an interface change made while it ran.
             this.refreshChildDevices()
@@ -364,21 +442,32 @@ class KasaCamera
         return client;
     }
 
-    private get spotlightNativeId(): string {
-        return `${this.nativeId}-spotlight`;
+    private childNativeId(kind: CameraChildKind): string {
+        return `${this.nativeId}${CAMERA_CHILDREN[kind].suffix}`;
     }
 
-    private get sirenNativeId(): string {
-        return `${this.nativeId}-siren`;
+    private child(kind: CameraChildKind): KasaCameraChild {
+        let child = this.children.get(kind);
+        if (!child) {
+            child = new KasaCameraChild(this, CAMERA_CHILDREN[kind], this.childNativeId(kind));
+            this.children.set(kind, child);
+        }
+        return child;
     }
 
-    private get privacyNativeId(): string {
-        return `${this.nativeId}-privacy`;
-    }
-
-    private getPrivacy(): KasaCameraPrivacy {
-        if (!this.privacy) this.privacy = new KasaCameraPrivacy(this, this.privacyNativeId);
-        return this.privacy;
+    // Publishes a child the camera turned out to have, and returns its device object.
+    private async publishChild(kind: CameraChildKind): Promise<KasaCameraChild> {
+        await deviceManager.onDeviceDiscovered({
+            nativeId: this.childNativeId(kind),
+            name: `${this.name || 'Kasa Camera'} ${CAMERA_CHILDREN[kind].label}`,
+            type: CAMERA_CHILDREN[kind].type,
+            interfaces: [ScryptedInterface.OnOff],
+            providerNativeId: this.nativeId,
+            // Inherit the camera's room so children show up next to it in the UI.
+            // Empty string would clear an existing room assignment, so pass undefined.
+            room: this.room || undefined,
+        });
+        return this.child(kind);
     }
 
     // Shown as the read-only "Video stream" setting. It can't be the Online interface: the
@@ -437,8 +526,8 @@ class KasaCamera
         // The child object is created lazily; a stream error can arrive before the first refresh
         // reached the camera, and the child's persisted state should still follow.
         const privacy =
-            this.privacy ??
-            (deviceManager.getNativeIds().includes(this.privacyNativeId) ? this.getPrivacy() : undefined);
+            this.children.get('privacy') ??
+            (deviceManager.getNativeIds().includes(this.childNativeId('privacy')) ? this.child('privacy') : undefined);
         if (privacy && privacy.on !== off) privacy.on = off;
         this.setPrivacyPoll(off);
     }
@@ -477,29 +566,31 @@ class KasaCamera
     // The two opt-in camera features. Each is published as an interface only while its setting is
     // on: Camera makes the Snapshot plugin take pictures from the camera instead of decoding a
     // prebuffer frame, and MotionSensor is where Video Analysis and HomeKit read motion from.
-    private async applyCameraFeatures(): Promise<void> {
-        const { cameraMotion, cameraSnapshots } = this.storageSettings.values;
-        // Stop before unpublishing MotionSensor: clearing motionDetected afterwards would be
-        // rejected for an interface the device no longer implements.
-        if (cameraMotion) this.startMotionPoll();
-        else this.stopMotionPoll();
+    // Runs are queued: each reads the settings when it starts, so after a quick on/off the last
+    // change wins instead of an earlier run finishing late with the old values.
+    private cameraFeaturesQueue: Promise<void> = Promise.resolve();
+    private applyCameraFeatures(): Promise<void> {
+        const run = this.cameraFeaturesQueue.then(() => this.applyCameraFeaturesNow());
+        this.cameraFeaturesQueue = run.catch(() => {});
+        return run;
+    }
 
-        const state = deviceManager.getDeviceState(this.nativeId);
-        if (!state || !this.nativeId) return;
-        const provided = state.providedInterfaces || [];
+    private async applyCameraFeaturesNow(): Promise<void> {
+        const { cameraMotion, cameraSnapshots } = this.storageSettings.values;
+        // Stop before unpublishing MotionSensor and start after publishing it: the server rejects
+        // a motionDetected write for an interface the device doesn't implement.
+        if (!cameraMotion) this.stopMotionPoll();
+
+        const provided = deviceManager.getDeviceState(this.nativeId)?.providedInterfaces;
+        if (!provided) return;
         const optional: string[] = [ScryptedInterface.Camera, ScryptedInterface.MotionSensor];
         const want = provided.filter(i => !optional.includes(i));
         if (cameraSnapshots) want.push(ScryptedInterface.Camera);
         if (cameraMotion) want.push(ScryptedInterface.MotionSensor);
-        if (want.length === provided.length && want.every(i => provided.includes(i))) return;
-        await deviceManager.onDeviceDiscovered({
-            nativeId: this.nativeId,
-            name: state.name || this.nativeId,
-            type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
-            interfaces: want,
-            info: state.info,
-            room: state.room || undefined,
-        });
+        if (want.length !== provided.length || !want.every(i => provided.includes(i)))
+            await republishDevice(this.nativeId, { interfaces: want });
+
+        if (cameraMotion) this.startMotionPoll();
     }
 
     // Bumped on every start/stop, so a poll that was in flight across one doesn't act on a
@@ -520,11 +611,16 @@ class KasaCamera
 
     private stopMotionPoll(): void {
         if (!this.motionPolling) return;
+        this.haltMotionPoll();
+        this.clearMotion();
+    }
+
+    // Ends the loop without writing motionDetected.
+    private haltMotionPoll(): void {
         this.motionPolling = false;
         this.motionPollGeneration++;
         clearTimeout(this.motionPoll);
         this.motionPoll = undefined;
-        this.clearMotion();
     }
 
     private clearMotion(): void {
@@ -598,14 +694,14 @@ class KasaCamera
     // Camera interface, published only while "Snapshots from camera" is on.
     async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
         // The camera answers 503 when it's off; skip the round trip.
-        if (this.privacyMode) throw new Error('Kasa camera is turned off (privacy mode)');
+        if (this.privacyMode) throw new CameraOffError();
         const { ip, port, username, password } = this.storageSettings.values;
         const jpeg = await fetchKasaSnapshot({ ip, port, username, password }).catch((e: Error) => {
             // Turned off outside the plugin (Kasa app) since Privacy Mode last synced.
             if (e instanceof KasaSnapshotError && e.statusCode === 503) return undefined;
             throw e;
         });
-        if (!jpeg) throw new Error('Kasa camera is turned off (privacy mode)');
+        if (!jpeg) throw new CameraOffError();
         return mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 
@@ -614,18 +710,10 @@ class KasaCamera
         return [{ id: 'snapshot', name: 'Camera Snapshot', picture: { width: 640, height: 360 } }];
     }
 
-    // Shared in-flight promise so concurrent triggers (constructor, putSetting,
-    // post-adoption) don't run the LINKIE probe loop in parallel against the same camera.
-    // The probes are sequential per call; running two in parallel would double the
-    // request load and racing onDeviceDiscovered() could re-register children twice.
-    private refreshChildDevicesInFlight?: Promise<void>;
-    async refreshChildDevices(): Promise<void> {
-        if (this.refreshChildDevicesInFlight) return this.refreshChildDevicesInFlight;
-        this.refreshChildDevicesInFlight = this.refreshChildDevicesInternal().finally(() => {
-            this.refreshChildDevicesInFlight = undefined;
-        });
-        return this.refreshChildDevicesInFlight;
-    }
+    // Shared between concurrent triggers (constructor, putSetting, post-adoption). The probes
+    // are sequential per call; two runs in parallel would double the request load on the
+    // camera, and racing onDeviceDiscovered() could re-register children twice.
+    readonly refreshChildDevices = singleFlight(() => this.refreshChildDevicesInternal());
 
     private async refreshChildDevicesInternal(): Promise<void> {
         const { ip, username, password } = this.storageSettings.values;
@@ -649,8 +737,7 @@ class KasaCamera
         // re-publish when one is missing. Never removed on a failed probe: an unreachable camera
         // looks the same as an unsupported one, and the hardware can't lose its motor or its
         // on/off switch.
-        const state = deviceManager.getDeviceState(this.nativeId);
-        const provided = state?.providedInterfaces || [];
+        const provided = deviceManager.getDeviceState(this.nativeId)?.providedInterfaces || [];
         const missing: string[] = [];
         if (ptzCapability && !provided.includes(ScryptedInterface.PanTiltZoom)) {
             this.console.log(`pan/tilt detected (max_x=${ptzCapability.maxX}, max_y=${ptzCapability.maxY})`);
@@ -658,16 +745,7 @@ class KasaCamera
         }
         const privacyModeAdded = cameraEnabled !== undefined && !provided.includes(PRIVACY_MODE_INTERFACE);
         if (privacyModeAdded) missing.push(PRIVACY_MODE_INTERFACE);
-        if (state && this.nativeId && missing.length) {
-            await deviceManager.onDeviceDiscovered({
-                nativeId: this.nativeId,
-                name: state.name || this.nativeId,
-                type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
-                interfaces: [...provided, ...missing],
-                info: state.info,
-                room: state.room || undefined,
-            });
-        }
+        if (missing.length) await republishDevice(this.nativeId, { interfaces: [...provided, ...missing] });
 
         if (ptzCapability) {
             this.ptzCapabilities = {
@@ -678,48 +756,13 @@ class KasaCamera
             };
         }
 
-        if (lampState !== undefined) {
-            await deviceManager.onDeviceDiscovered({
-                nativeId: this.spotlightNativeId,
-                name: `${this.name || 'Kasa Camera'} Spotlight`,
-                type: ScryptedDeviceType.Light,
-                interfaces: [ScryptedInterface.OnOff],
-                providerNativeId: this.nativeId,
-                // Inherit the camera's room so children show up next to it in the UI.
-                // Empty string would clear an existing room assignment, so pass undefined.
-                room: this.room || undefined,
-            });
-            if (!this.spotlight) this.spotlight = new KasaCameraSpotlight(this, this.spotlightNativeId);
-            this.spotlight.on = lampState === 'on';
-        }
-
-        if (sirenState !== undefined) {
-            await deviceManager.onDeviceDiscovered({
-                nativeId: this.sirenNativeId,
-                name: `${this.name || 'Kasa Camera'} Siren`,
-                // HomeKit folds a camera's Light and Siren children into the camera
-                // accessory; any other type is bridged as a standalone accessory.
-                type: ScryptedDeviceType.Siren,
-                interfaces: [ScryptedInterface.OnOff],
-                providerNativeId: this.nativeId,
-                room: this.room || undefined,
-            });
-            if (!this.siren) this.siren = new KasaCameraSiren(this, this.sirenNativeId);
-            this.siren.on = sirenState === 'on';
-        }
+        if (lampState !== undefined) (await this.publishChild('spotlight')).on = lampState === 'on';
+        if (sirenState !== undefined) (await this.publishChild('siren')).on = sirenState === 'on';
 
         if (cameraEnabled !== undefined) {
-            await deviceManager.onDeviceDiscovered({
-                nativeId: this.privacyNativeId,
-                name: `${this.name || 'Kasa Camera'} Privacy Mode`,
-                type: ScryptedDeviceType.Switch,
-                interfaces: [ScryptedInterface.OnOff],
-                providerNativeId: this.nativeId,
-                room: this.room || undefined,
-            });
-            // Create the child eagerly: getNativeIds() may not list it yet (the server pushes that
-            // separately), and updatePrivacyState only syncs a child it can find.
-            this.getPrivacy();
+            // This also creates the child object: getNativeIds() may not list it yet (the server
+            // pushes that separately), and updatePrivacyState only syncs a child it can find.
+            await this.publishChild('privacy');
             // A privacy change made during the probes is newer than cameraEnabled.
             const off = privacyChanges === this.privacyChanges ? cameraEnabled === 'off' : this.lastPrivacySet;
             this.updatePrivacyState(off, privacyModeAdded);
@@ -727,23 +770,16 @@ class KasaCamera
     }
 
     async getDevice(nativeId: string): Promise<any> {
-        if (nativeId === this.spotlightNativeId) {
-            if (!this.spotlight) this.spotlight = new KasaCameraSpotlight(this, this.spotlightNativeId);
-            return this.spotlight;
-        }
-        if (nativeId === this.sirenNativeId) {
-            if (!this.siren) this.siren = new KasaCameraSiren(this, this.sirenNativeId);
-            return this.siren;
-        }
-        if (nativeId === this.privacyNativeId) return this.getPrivacy();
+        const kind = CAMERA_CHILD_KINDS.find(k => nativeId === this.childNativeId(k));
+        return kind && this.child(kind);
     }
 
     async releaseDevice(_id: string, nativeId: string): Promise<void> {
         // Drop the cached child so state updates stop writing to a removed device; a later
         // refresh re-creates it if the camera still has the feature.
-        if (nativeId === this.spotlightNativeId) this.spotlight = undefined;
-        if (nativeId === this.sirenNativeId) this.siren = undefined;
-        if (nativeId === this.privacyNativeId) this.privacy = undefined;
+        for (const kind of CAMERA_CHILD_KINDS) {
+            if (nativeId === this.childNativeId(kind)) this.children.delete(kind);
+        }
     }
 
     storageSettings = new StorageSettings(this, {
@@ -867,8 +903,7 @@ class KasaCamera
             await this.linkie().reboot();
             // The camera is about to drop every socket anyway; closing ours now lets clients
             // start their reconnect loop immediately instead of waiting for a read timeout.
-            for (const kill of [...this.activeStreamKills]) kill.resolve();
-            this.stopIntercom().catch(() => {});
+            this.closeStreams();
             return;
         }
         await this.storageSettings.putSetting(key, value);
@@ -880,8 +915,7 @@ class KasaCamera
             // Tear down active streams + intercom — they're holding TCP sockets to the old
             // endpoint, which keeps delivering frames from the wrong camera until something
             // else closes them. Clients will reconnect against the new settings.
-            for (const kill of [...this.activeStreamKills]) kill.resolve();
-            this.stopIntercom().catch(() => {});
+            this.closeStreams();
             // Re-probe child devices when network or auth settings change. Manually-added
             // cameras get their credentials filled in here (rather than at adoption), so this
             // is the moment the spotlight first becomes detectable.
@@ -963,10 +997,7 @@ class KasaCamera
             this.console.log('camera is turned off (privacy mode); video is unavailable until it is turned back on');
         }
         this.updatePrivacyState(true);
-        const off = new CameraOffError('Kasa camera is turned off (privacy mode)');
-        // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
-        off.stack = off.message;
-        return off;
+        return new CameraOffError();
     }
 
     // :19443 refusing connections while :10443 still answers means the camera's stream server
@@ -1007,10 +1038,7 @@ class KasaCamera
         }
 
         await new Promise(r => setTimeout(r, STREAM_DOWN_RETRY_DELAY_MS));
-        const down = new Error('Kasa camera video stream is down (connection refused)');
-        // Drop the stack: the state is already logged once above, and this is logged on every retry.
-        down.stack = down.message;
-        return down;
+        return new StreamServerDownError();
     }
 
     wakeCameraOffWaiters(): void {
@@ -1068,8 +1096,7 @@ class KasaCamera
             } catch (e) {
                 const err = await this.explainStreamError(e as Error);
                 if (err instanceof CameraOffError) this.setStreamStatus('off');
-                // A replaced error means explainStreamServerDown confirmed the dead stream server.
-                else if (err !== e)
+                else if (err instanceof StreamServerDownError)
                     this.setStreamStatus(
                         'down',
                         'The camera refuses video connections but still answers controls; its stream server has stopped. Press Reboot camera below.',
@@ -1319,23 +1346,25 @@ class KasaCamera
     // and kasa HTTPS sockets running after the plugin is gone, since child_process is
     // owned by the host Node process, not the worker.
     release(): void {
-        // Each kill triggers cleanupAll inside spawnKasaStream — destroys the kasa
-        // connection and closes the local RTSP server.
-        for (const kill of [...this.activeStreamKills]) kill.resolve();
-        // Stop the intercom too if anything was active. stopIntercom is async only because
-        // its signature is — the work it does is synchronous, so fire-and-forget is fine.
-        this.stopIntercom().catch(() => {});
+        this.closeStreams();
         this.released = true;
         if (this.privacyPoll) clearInterval(this.privacyPoll);
         this.privacyPoll = undefined;
-        // Stop polling without stopMotionPoll(): the device is going away, so don't publish a
-        // final motionDetected write.
-        this.motionPolling = false;
-        this.motionPollGeneration++;
-        clearTimeout(this.motionPoll);
+        // Not stopMotionPoll(): the device is going away, so don't publish a final
+        // motionDetected write.
+        this.haltMotionPoll();
         clearTimeout(this.motionHoldTimer);
         this.cachedLinkie?.client.destroy();
         this.cachedLinkie = undefined;
+    }
+
+    // Closes every live stream and the intercom. Each kill triggers cleanupAll inside
+    // spawnKasaStream, which destroys the kasa connection and closes the local RTSP server.
+    private closeStreams(): void {
+        for (const kill of [...this.activeStreamKills]) kill.resolve();
+        // stopIntercom is async only because its signature is — the work it does is
+        // synchronous, so fire-and-forget is fine.
+        this.stopIntercom().catch(() => {});
     }
 }
 
@@ -1430,21 +1459,12 @@ class KasaPlugin
         if (key === 'refresh') await this.refreshAllDevices();
     }
 
-    // Shared in-flight promise so two clicks of the Refresh button don't kick off two
-    // overlapping discovery sweeps. Same pattern as scanInFlight in discoverDevices.
-    private refreshInFlight?: Promise<void>;
-
-    // Re-run UDP discovery and update each adopted device's `info` (model, hardware
-    // version, firmware, IP, MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
+    // Re-run UDP discovery and update each adopted device's `info` (model, hardware version,
+    // firmware, IP, MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
     // (powered off, on a different subnet) are left alone — we don't want to clobber
-    // good cached data with a one-shot network blip.
-    private async refreshAllDevices(): Promise<void> {
-        if (this.refreshInFlight) return this.refreshInFlight;
-        this.refreshInFlight = this.refreshAllDevicesInternal().finally(() => {
-            this.refreshInFlight = undefined;
-        });
-        return this.refreshInFlight;
-    }
+    // good cached data with a one-shot network blip. Shared, so two clicks of the Refresh
+    // button don't start two overlapping sweeps.
+    private refreshAllDevices = singleFlight(() => this.refreshAllDevicesInternal());
 
     private async refreshAllDevicesInternal(): Promise<void> {
         this.console.log('refresh: running UDP discovery sweep');
@@ -1495,30 +1515,20 @@ class KasaPlugin
             }
 
             const existing = state.info || {};
-            const sw_ver = typeof fresh.sysinfo?.sw_ver === 'string' ? fresh.sysinfo.sw_ver : undefined;
             const newInfo = {
                 ...existing,
-                manufacturer: 'TP-Link Kasa',
+                manufacturer: KASA_MANUFACTURER,
                 model: preferStr(fresh.model, existing.model),
                 mac: preferStr(fresh.mac, existing.mac),
                 // IP always takes the freshly-observed value — capturing a DHCP-rotated
                 // address is the whole point of the refresh.
                 ip: fresh.address,
-                firmware: preferStr(sw_ver, existing.firmware),
+                firmware: preferStr(fresh.firmware, existing.firmware),
                 version: preferStr(sysinfoHwVer(fresh), existing.version),
             };
 
-            // Re-publish without touching providedInterfaces — refreshing metadata, not
-            // capabilities. Mixin-provided interfaces (HomeKit, etc.) live in `interfaces`
-            // and would be incorrectly re-claimed if we passed those back.
-            await deviceManager.onDeviceDiscovered({
-                nativeId,
-                name: state.name || nativeId,
-                type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
-                interfaces: state.providedInterfaces || [],
-                info: newInfo,
-                room: state.room || undefined,
-            });
+            // Metadata only; the interface list stays as it is.
+            await republishDevice(nativeId, { info: newInfo });
 
             // Keep per-device storage in sync — that's what the device classes actually
             // use to connect. Update the in-memory storageSettings too if the device is
@@ -1548,20 +1558,9 @@ class KasaPlugin
             if (isCameraChildNativeId(nativeId)) continue;
             const state = deviceManager.getDeviceState(nativeId);
             if (!state) continue;
-            // providedInterfaces is the list this plugin originally registered; the
-            // `interfaces` field also includes mixin-provided interfaces (HomeKit, etc.)
-            // which we must NOT re-claim ownership of by passing them back to
-            // onDeviceDiscovered.
             const provided = state.providedInterfaces || [];
             if (provided.includes(ScryptedInterface.Readme)) continue;
-            await deviceManager.onDeviceDiscovered({
-                nativeId,
-                name: state.name || nativeId,
-                type: (state.type || ScryptedDeviceType.Unknown) as ScryptedDeviceType,
-                interfaces: [...provided, ScryptedInterface.Readme],
-                info: state.info,
-                room: state.room || undefined,
-            });
+            await republishDevice(nativeId, { interfaces: [...provided, ScryptedInterface.Readme] });
         }
     }
 
@@ -1696,7 +1695,6 @@ class KasaPlugin
 
         if (kasaClass === 'camera') {
             await this.registerCamera(nativeId, name, room);
-            deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', 'camera');
             return nativeId;
         }
         await this.registerIotDevice(nativeId, name, room, kasaClass);
@@ -1710,40 +1708,18 @@ class KasaPlugin
         nativeId: string,
         name: string,
         room: string | undefined,
-        kasaClass: KasaDeviceClass,
+        kasaClass: Exclude<KasaDeviceClass, 'camera'>,
     ): Promise<void> {
-        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings, ScryptedInterface.Readme];
-        let type: ScryptedDeviceType;
-        switch (kasaClass) {
-            case 'plug':
-                type = ScryptedDeviceType.Outlet;
-                break;
-            case 'switch':
-                type = ScryptedDeviceType.Switch;
-                break;
-            case 'dimmer':
-                type = ScryptedDeviceType.Light;
-                interfaces.push(ScryptedInterface.Brightness);
-                break;
-            case 'bulb':
-                type = ScryptedDeviceType.Light;
-                interfaces.push(ScryptedInterface.Brightness);
-                // Color/color-temp interfaces are probed from sysinfo on adoption; manual-
-                // create bulbs default to brightness only. The user can re-discover if they
-                // need full color support detected automatically.
-                break;
-            default:
-                throw new Error(`unknown kasaClass: ${kasaClass}`);
-        }
+        const shape = iotDeviceShape(kasaClass);
         await deviceManager.onDeviceDiscovered({
             nativeId,
             name,
-            type,
-            interfaces,
-            info: { manufacturer: 'TP-Link Kasa' },
+            type: shape.type,
+            interfaces: shape.interfaces,
+            info: { manufacturer: KASA_MANUFACTURER },
             room: room || undefined,
         });
-        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', kasaClass);
+        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', shape.kasaClass);
     }
 
     private async registerCamera(
@@ -1759,24 +1735,13 @@ class KasaPlugin
             version?: string;
         },
     ): Promise<void> {
-        const device: Device = {
+        await deviceManager.onDeviceDiscovered({
             nativeId,
             name,
             type: ScryptedDeviceType.Camera,
-            interfaces: [
-                ScryptedInterface.VideoCamera,
-                ScryptedInterface.Settings,
-                ScryptedInterface.Intercom,
-                // Required so Scrypted routes child-device lookups (e.g. the spotlight)
-                // through KasaCamera.getDevice rather than treating the camera as a leaf.
-                ScryptedInterface.DeviceProvider,
-                // OnOff drives the camera's status LED — HomeKit binds its
-                // CameraOperatingModeIndicator characteristic to this.
-                ScryptedInterface.OnOff,
-                ScryptedInterface.Readme,
-            ],
+            interfaces: [...CAMERA_INTERFACES],
             info: {
-                manufacturer: 'TP-Link Kasa',
+                manufacturer: KASA_MANUFACTURER,
                 model: info?.model || undefined,
                 mac: info?.mac || undefined,
                 ip: info?.ip || undefined,
@@ -1786,8 +1751,8 @@ class KasaPlugin
             },
             // Empty string would clear the room on re-discovery; pass undefined to leave alone.
             room: room || undefined,
-        };
-        await deviceManager.onDeviceDiscovered(device);
+        });
+        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', 'camera');
     }
 
     async discoverDevices(scan?: boolean): Promise<DiscoveredDevice[]> {
@@ -1827,7 +1792,7 @@ class KasaPlugin
         defaults: { username: string; password: string },
     ): DiscoveredDevice {
         const info = {
-            manufacturer: 'TP-Link Kasa',
+            manufacturer: KASA_MANUFACTURER,
             model: device.model,
             mac: device.mac,
             ip: device.address,
@@ -1846,14 +1811,7 @@ class KasaPlugin
                 name: fallbackName,
                 description: `${device.model || 'Kasa Camera'} @ ${device.address}`,
                 type: ScryptedDeviceType.Camera,
-                interfaces: [
-                    ScryptedInterface.VideoCamera,
-                    ScryptedInterface.Settings,
-                    ScryptedInterface.Intercom,
-                    ScryptedInterface.DeviceProvider,
-                    ScryptedInterface.OnOff,
-                    ScryptedInterface.Readme,
-                ],
+                interfaces: [...CAMERA_INTERFACES],
                 info,
                 // Cameras need the cloud account credentials too — auth on the stream/talk
                 // endpoints. Plugs/bulbs are local-only with no auth.
@@ -1870,27 +1828,8 @@ class KasaPlugin
             };
         }
 
-        // Plug, Switch, Bulb — all share the same simpler adoption form.
-        const interfaces = [ScryptedInterface.OnOff, ScryptedInterface.Settings, ScryptedInterface.Readme];
-        let type: ScryptedDeviceType;
-        if (cls === 'bulb') {
-            type = ScryptedDeviceType.Light;
-            interfaces.push(ScryptedInterface.Brightness);
-            const caps = bulbCapabilities(device);
-            if (caps.isColor) interfaces.push(ScryptedInterface.ColorSettingHsv);
-            if (caps.isVariableColorTemp) interfaces.push(ScryptedInterface.ColorSettingTemperature);
-        } else {
-            // Dimmer plug/switch (HS220, KS230, ...) is almost always wired to a light, so
-            // expose as Light. Plain plugs → Outlet; plain switches → Switch.
-            const dimmer = isDimmer(device);
-            if (dimmer) {
-                type = ScryptedDeviceType.Light;
-                interfaces.push(ScryptedInterface.Brightness);
-            } else {
-                type = cls === 'switch' ? ScryptedDeviceType.Switch : ScryptedDeviceType.Outlet;
-            }
-        }
-
+        // Plug, switch, dimmer, bulb — all share the same simpler adoption form.
+        const { type, interfaces } = iotDeviceShape(cls, device);
         return {
             nativeId: device.deviceId,
             name: fallbackName,
@@ -2007,10 +1946,9 @@ class KasaPlugin
             mac: device.mac,
             ip: device.address,
             serialNumber: device.deviceId,
-            firmware: typeof device.sysinfo?.sw_ver === 'string' ? device.sysinfo.sw_ver : undefined,
+            firmware: device.firmware,
             version: sysinfoHwVer(device),
         });
-        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', 'camera');
         const camera = (await this.getDevice(nativeId)) as KasaCamera;
 
         camera.storageSettings.values.ip = device.address;
@@ -2028,49 +1966,24 @@ class KasaPlugin
         adopt: AdoptDevice,
         nativeId: string,
         device: KasaDiscoveredDevice,
-        cls: KasaDeviceClass,
+        cls: Exclude<KasaDeviceClass, 'camera'>,
         name: string,
         room?: string,
     ): Promise<string> {
-        const interfaces: ScryptedInterface[] = [
-            ScryptedInterface.OnOff,
-            ScryptedInterface.Settings,
-            ScryptedInterface.Readme,
-        ];
-        let type: ScryptedDeviceType;
-        const caps = bulbCapabilities(device);
-        // The marker we persist for getDevice routing. 'plug'/'switch' for plain on/off
-        // devices, 'dimmer' for anything with brightness control, 'bulb' for true bulbs.
-        let storedClass: KasaDeviceClass = cls;
-
-        if (cls === 'bulb') {
-            type = ScryptedDeviceType.Light;
-            interfaces.push(ScryptedInterface.Brightness);
-            if (caps.isColor) interfaces.push(ScryptedInterface.ColorSettingHsv);
-            if (caps.isVariableColorTemp) interfaces.push(ScryptedInterface.ColorSettingTemperature);
-        } else if (isDimmer(device)) {
-            // Dimmer plug or dimmer switch — both expose as Light with Brightness.
-            type = ScryptedDeviceType.Light;
-            interfaces.push(ScryptedInterface.Brightness);
-            storedClass = 'dimmer';
-        } else {
-            type = cls === 'switch' ? ScryptedDeviceType.Switch : ScryptedDeviceType.Outlet;
-        }
-
-        const sw_ver = typeof device.sysinfo?.sw_ver === 'string' ? device.sysinfo.sw_ver : undefined;
+        const shape = iotDeviceShape(cls, device);
         await deviceManager.onDeviceDiscovered({
             nativeId,
             name,
-            type,
-            interfaces,
+            type: shape.type,
+            interfaces: shape.interfaces,
             room: room || undefined,
             info: {
-                manufacturer: 'TP-Link Kasa',
+                manufacturer: KASA_MANUFACTURER,
                 model: device.model,
                 mac: device.mac,
                 ip: device.address,
                 serialNumber: device.deviceId,
-                firmware: sw_ver,
+                firmware: device.firmware,
                 version: sysinfoHwVer(device),
             },
         });
@@ -2078,12 +1991,13 @@ class KasaPlugin
         // Persist the class marker so getDevice routes to the right implementation —
         // multiple device classes share the same Scrypted device type (true bulbs and
         // dimmers both register as Light).
-        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', storedClass);
+        deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', shape.kasaClass);
 
         const dev = await this.getDevice(nativeId);
         dev.storageSettings.values.ip = device.address;
         dev.storageSettings.values.port = KASA_IOT_PORT;
-        if (cls === 'bulb' && dev instanceof KasaBulb) {
+        if (dev instanceof KasaBulb) {
+            const caps = bulbCapabilities(device);
             dev.storageSettings.values.isColor = caps.isColor;
             dev.storageSettings.values.isVariableColorTemp = caps.isVariableColorTemp;
         }
@@ -2144,9 +2058,8 @@ class KasaPlugin
     }
 
     async releaseDevice(_id: string, nativeId: string): Promise<void> {
-        const dev = this.devices.get(nativeId);
-        // Plug/Bulb instances run a state-poll timer that needs to be cleared.
-        if (dev && 'release' in dev && typeof (dev as any).release === 'function') (dev as any).release();
+        // Every device class holds timers or connections that release() has to clear.
+        this.devices.get(nativeId)?.release();
         this.devices.delete(nativeId);
     }
 }
