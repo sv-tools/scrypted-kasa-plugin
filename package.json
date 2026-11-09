@@ -67,7 +67,18 @@
       ],
       "pluginDependencies": [
          "@scrypted/prebuffer-mixin"
-      ]
+      ],
+      "interfaceDescriptors": {
+         "PrivacyMode": {
+            "name": "PrivacyMode",
+            "methods": [
+               "setPrivacyMode"
+            ],
+            "properties": [
+               "privacyMode"
+            ]
+         }
+      }
    },
    "devDependencies": {
       "@eslint/js": "^10.0.1",

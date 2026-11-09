@@ -59,6 +59,10 @@ const AUTO_REBOOT_COOLDOWN_MS = 30 * 60_000;
 // switch device wakes the hold immediately.
 const CAMERA_OFF_HOLD_MS = MAX_STREAM_HOLD_MS;
 const CAMERA_OFF_POLL_MS = 5_000;
+// While the camera is off, how often to check whether it was turned back on elsewhere (Kasa
+// app). Stream attempts also notice, but HomeKit stops requesting streams from a camera it
+// shows as off, so without this it could stay off in the Home app indefinitely.
+const PRIVACY_POLL_MS = 60_000;
 
 // The stream error for a camera turned off in Privacy Mode; getVideoStream holds on it.
 class CameraOffError extends Error {}
@@ -70,6 +74,15 @@ function formatDuration(ms: number): string {
     const h = Math.floor(min / 60);
     if (h < 48) return `${h} h ${min % 60} min`;
     return `${Math.floor(h / 24)} days`;
+}
+
+// PrivacyMode is newer than the @scrypted/sdk this plugin builds against, so it's declared here
+// and its descriptor ships in package.json (scrypted.interfaceDescriptors) for the server.
+// The HomeKit plugin binds it to the camera's own on/off in the Home app.
+const PRIVACY_MODE_INTERFACE = 'PrivacyMode';
+interface PrivacyMode {
+    privacyMode?: boolean;
+    setPrivacyMode(privacyMode: boolean): Promise<void>;
 }
 
 function isConnectionRefused(e: Error): boolean {
@@ -224,7 +237,7 @@ class KasaCameraSiren extends ScryptedDeviceBase implements OnOff {
 
 // Child switch for the camera's own on/off, inverted so it reads naturally in HomeKit
 // automations ("when I arrive, turn on Kitchen Privacy Mode"): on = camera turned off.
-// Backed by smartlife.cam.ipcamera.switch.set_is_enable.
+// Mirrors the camera's PrivacyMode, which does the work.
 class KasaCameraPrivacy extends ScryptedDeviceBase implements OnOff {
     constructor(
         public camera: KasaCamera,
@@ -234,16 +247,11 @@ class KasaCameraPrivacy extends ScryptedDeviceBase implements OnOff {
     }
 
     async turnOn(): Promise<void> {
-        await this.camera.linkie().setCameraEnabled(false);
-        this.on = true;
+        await this.camera.setPrivacyMode(true);
     }
 
     async turnOff(): Promise<void> {
-        await this.camera.linkie().setCameraEnabled(true);
-        this.on = false;
-        // A stream attempt may be parked waiting for the camera to come back on; let it
-        // connect now instead of at its next poll.
-        this.camera.wakeCameraOffWaiters();
+        await this.camera.setPrivacyMode(false);
     }
 }
 
@@ -262,7 +270,7 @@ function kasaPtzSpeed(v: number): number {
 
 class KasaCamera
     extends ScryptedDeviceBase
-    implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, PanTiltZoom, Readme
+    implements VideoCamera, Settings, Intercom, DeviceProvider, OnOff, PanTiltZoom, PrivacyMode, Readme
 {
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
@@ -272,6 +280,13 @@ class KasaCamera
     // Set while stream attempts are failing because the camera is turned off, so the
     // "turned off" / "back on" transitions are logged once instead of on every retry.
     private cameraOffLogged = false;
+    // Bumped on every privacy change we make, so a camera-state probe that raced one can tell
+    // its answer is stale.
+    private privacyChanges = 0;
+    private lastPrivacySet = false;
+    private privacyPoll?: NodeJS.Timeout;
+    // Set by release(); a refresh or stream retry still in flight must not re-arm the poll.
+    private released = false;
     // Stream attempts parked in waitForCameraOn(), woken early when Privacy Mode is turned off.
     private cameraOffWaiters = new Set<() => void>();
     // Set while :19443 refuses connections but the control plane still answers: the camera's
@@ -289,9 +304,12 @@ class KasaCamera
         super(nativeId);
         // Probe-and-register child devices once settings are available. process.nextTick
         // defers past constructor so storageSettings is fully wired.
-        process.nextTick(() =>
-            this.refreshChildDevices().catch(e => this.console.warn('refreshChildDevices failed', e)),
-        );
+        process.nextTick(() => {
+            // Resume watching for the camera coming back on even if the probe below can't reach
+            // it; otherwise a persisted "off" would stay off in HomeKit indefinitely.
+            if (this.privacyMode) this.setPrivacyPoll(true);
+            this.refreshChildDevices().catch(e => this.console.warn('refreshChildDevices failed', e));
+        });
     }
 
     private cachedLinkie?: { client: KasaLinkieClient; ip: string; username: string; password: string };
@@ -353,6 +371,69 @@ class KasaCamera
         };
     }
 
+    // The SDK only generates accessors for the properties it knows, so privacyMode goes through
+    // the device state directly.
+    get privacyMode(): boolean | undefined {
+        this._lazyLoadDeviceState();
+        return (this as any)._deviceState?.privacyMode;
+    }
+
+    set privacyMode(value: boolean | undefined) {
+        this._lazyLoadDeviceState();
+        (this as any)._deviceState.privacyMode = value;
+    }
+
+    // Records the camera's on/off on both the camera (PrivacyMode) and the Privacy Mode child,
+    // only when it changed, so repeated stream retries don't fire events. `force` covers the
+    // refresh that first publishes PrivacyMode: the plugin's copy of providedInterfaces may not
+    // include it yet right after onDeviceDiscovered, so the published check would skip the write.
+    private updatePrivacyState(off: boolean, force = false): void {
+        // Cameras without the switch never get PrivacyMode, and the server rejects writes to an
+        // interface the device doesn't implement ("PrivacyMode not implemented").
+        const published = deviceManager
+            .getDeviceState(this.nativeId)
+            ?.providedInterfaces?.includes(PRIVACY_MODE_INTERFACE);
+        if (force || (published && this.privacyMode !== off)) this.privacyMode = off;
+        // The child object is created lazily; a stream error can arrive before the first refresh
+        // reached the camera, and the child's persisted state should still follow.
+        const privacy =
+            this.privacy ??
+            (deviceManager.getNativeIds().includes(this.privacyNativeId) ? this.getPrivacy() : undefined);
+        if (privacy && privacy.on !== off) privacy.on = off;
+        this.setPrivacyPoll(off);
+    }
+
+    private setPrivacyPoll(off: boolean): void {
+        if (off && !this.privacyPoll && !this.released) {
+            this.privacyPoll = setInterval(
+                () =>
+                    this.pollCameraBackOn().catch(e => this.console.warn('privacy poll failed:', (e as Error).message)),
+                PRIVACY_POLL_MS,
+            );
+        } else if (!off && this.privacyPoll) {
+            clearInterval(this.privacyPoll);
+            this.privacyPoll = undefined;
+        }
+    }
+
+    private async pollCameraBackOn(): Promise<void> {
+        const changes = this.privacyChanges;
+        if ((await this.linkie().getCameraEnabled()) !== 'on' || changes !== this.privacyChanges) return;
+        this.console.log('camera was turned back on');
+        this.updatePrivacyState(false);
+        this.wakeCameraOffWaiters();
+    }
+
+    async setPrivacyMode(privacyMode: boolean): Promise<void> {
+        await this.linkie().setCameraEnabled(!privacyMode);
+        this.privacyChanges++;
+        this.lastPrivacySet = privacyMode;
+        this.updatePrivacyState(privacyMode);
+        // A stream attempt may be parked waiting for the camera to come back on; let it
+        // connect now instead of at its next poll.
+        if (!privacyMode) this.wakeCameraOffWaiters();
+    }
+
     // Shared in-flight promise so concurrent triggers (constructor, putSetting,
     // post-adoption) don't run the LINKIE probe loop in parallel against the same camera.
     // The probes are sequential per call; running two in parallel would double the
@@ -374,6 +455,7 @@ class KasaCamera
         // Probe each capability sequentially. The Kasa iOS app issues LINKIE2 calls
         // serially; firing them in parallel against the same camera occasionally drops
         // responses (likely camera-side request serialization).
+        const privacyChanges = this.privacyChanges;
         const ledState = await linkie.getLedStatus();
         const lampState = await linkie.getForceLampState();
         const sirenState = await linkie.getSirenState();
@@ -383,23 +465,31 @@ class KasaCamera
 
         if (ledState !== undefined) this.on = ledState === 'on';
 
+        // PanTiltZoom and PrivacyMode are added on the camera itself (not a child), so only
+        // re-publish when one is missing. Never removed on a failed probe: an unreachable camera
+        // looks the same as an unsupported one, and the hardware can't lose its motor or its
+        // on/off switch.
+        const state = deviceManager.getDeviceState(this.nativeId);
+        const provided = state?.providedInterfaces || [];
+        const missing: string[] = [];
+        if (ptzCapability && !provided.includes(ScryptedInterface.PanTiltZoom)) {
+            this.console.log(`pan/tilt detected (max_x=${ptzCapability.maxX}, max_y=${ptzCapability.maxY})`);
+            missing.push(ScryptedInterface.PanTiltZoom);
+        }
+        const privacyModeAdded = cameraEnabled !== undefined && !provided.includes(PRIVACY_MODE_INTERFACE);
+        if (privacyModeAdded) missing.push(PRIVACY_MODE_INTERFACE);
+        if (state && this.nativeId && missing.length) {
+            await deviceManager.onDeviceDiscovered({
+                nativeId: this.nativeId,
+                name: state.name || this.nativeId,
+                type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
+                interfaces: [...provided, ...missing],
+                info: state.info,
+                room: state.room || undefined,
+            });
+        }
+
         if (ptzCapability) {
-            // PanTiltZoom is added on the camera itself (not a child), so only re-publish when
-            // it's missing. Never removed on a failed probe: an unreachable camera looks the
-            // same as an unsupported one, and the hardware can't lose its motor.
-            const state = deviceManager.getDeviceState(this.nativeId);
-            const provided = state?.providedInterfaces || [];
-            if (state && this.nativeId && !provided.includes(ScryptedInterface.PanTiltZoom)) {
-                this.console.log(`pan/tilt detected (max_x=${ptzCapability.maxX}, max_y=${ptzCapability.maxY})`);
-                await deviceManager.onDeviceDiscovered({
-                    nativeId: this.nativeId,
-                    name: state.name || this.nativeId,
-                    type: (state.type || ScryptedDeviceType.Camera) as ScryptedDeviceType,
-                    interfaces: [...provided, ScryptedInterface.PanTiltZoom],
-                    info: state.info,
-                    room: state.room || undefined,
-                });
-            }
             this.ptzCapabilities = {
                 pan: true,
                 tilt: true,
@@ -447,7 +537,12 @@ class KasaCamera
                 providerNativeId: this.nativeId,
                 room: this.room || undefined,
             });
-            this.getPrivacy().on = cameraEnabled === 'off';
+            // Create the child eagerly: getNativeIds() may not list it yet (the server pushes that
+            // separately), and updatePrivacyState only syncs a child it can find.
+            this.getPrivacy();
+            // A privacy change made during the probes is newer than cameraEnabled.
+            const off = privacyChanges === this.privacyChanges ? cameraEnabled === 'off' : this.lastPrivacySet;
+            this.updatePrivacyState(off, privacyModeAdded);
         }
     }
 
@@ -463,8 +558,12 @@ class KasaCamera
         if (nativeId === this.privacyNativeId) return this.getPrivacy();
     }
 
-    async releaseDevice(_id: string, _nativeId: string): Promise<void> {
-        // No persistent resources per child to release.
+    async releaseDevice(_id: string, nativeId: string): Promise<void> {
+        // Drop the cached child so state updates stop writing to a removed device; a later
+        // refresh re-creates it if the camera still has the feature.
+        if (nativeId === this.spotlightNativeId) this.spotlight = undefined;
+        if (nativeId === this.sirenNativeId) this.siren = undefined;
+        if (nativeId === this.privacyNativeId) this.privacy = undefined;
     }
 
     storageSettings = new StorageSettings(this, {
@@ -649,12 +748,15 @@ class KasaCamera
     private async explainStreamError(e: Error): Promise<Error> {
         if (isConnectionRefused(e)) return this.explainStreamServerDown(e);
         if (!/HTTP 503\b/.test(e.message)) return e;
+        const changes = this.privacyChanges;
         if ((await this.linkie().getCameraEnabled()) !== 'off') return e;
+        // Turned back on while the probe was in flight; its 'off' is stale.
+        if (changes !== this.privacyChanges && !this.lastPrivacySet) return e;
         if (!this.cameraOffLogged) {
             this.cameraOffLogged = true;
             this.console.log('camera is turned off (privacy mode); video is unavailable until it is turned back on');
         }
-        if (this.privacy) this.privacy.on = true;
+        this.updatePrivacyState(true);
         const off = new CameraOffError('Kasa camera is turned off (privacy mode)');
         // Drop the stack: it's an expected state, not a fault, and it's logged on every retry.
         off.stack = off.message;
@@ -741,6 +843,7 @@ class KasaCamera
         const { ip, port, username, password } = this.storageSettings.values;
         // Any hold below counts from here, so the connect and switch checks are inside the budget.
         const holdDeadline = Date.now() + CAMERA_OFF_HOLD_MS;
+        const privacyChanges = this.privacyChanges;
 
         if (!ip || !username || !password)
             throw new Error('Kasa camera is not configured. Set IP, username, and password.');
@@ -778,8 +881,10 @@ class KasaCamera
         if (this.cameraOffLogged) {
             this.cameraOffLogged = false;
             this.console.log('camera is back on, video resumed');
-            if (this.privacy) this.privacy.on = false;
         }
+        // A connected stream means the camera is on, even if it was turned back on in the Kasa
+        // app before any stream attempt saw it off; unless privacy was turned on mid-connect.
+        if (privacyChanges === this.privacyChanges) this.updatePrivacyState(false);
 
         // Single shared kill switch: any teardown source (kasa close, RTSP client
         // disconnect, pump error) resolves it, and every owned resource registers a
@@ -1014,6 +1119,9 @@ class KasaCamera
         // Stop the intercom too if anything was active. stopIntercom is async only because
         // its signature is — the work it does is synchronous, so fire-and-forget is fine.
         this.stopIntercom().catch(() => {});
+        this.released = true;
+        if (this.privacyPoll) clearInterval(this.privacyPoll);
+        this.privacyPoll = undefined;
     }
 }
 

@@ -33,7 +33,13 @@ In Scrypted:
   child switch. On turns the camera off, which stops video for every client, not just
   HomeKit, so it suits home/away automations. While the camera is off, stream attempts fail
   with a short "turned off" message instead of an error, and video resumes on its own when
-  it's turned back on.
+  it's turned back on. The camera also exposes this state as a `PrivacyMode` interface. A
+  HomeKit plugin with PrivacyMode support binds it to the camera's on/off in the Home app
+  (including Home/Away camera modes). That needs HomeKit Secure Video recording (a motion
+  source, or HomeKit Secure Video 3) and is turned on per camera with the HomeKit plugin's
+  **Camera Privacy Mode** setting. Home hubs reapply the Home app's camera mode whenever
+  they reconnect, so turning the camera on or off here or in the Kasa app only lasts until
+  then.
 - Exposes the camera's **status LED** as the camera's own `OnOff` interface, so HomeKit's
   per-camera "Link Status Indicator" toggle drives the LED.
 - Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
@@ -149,8 +155,9 @@ setup below.
   - `smartlife.cam.ipcamera.siren.get_state` — same pattern; produces a "<camera> Siren"
     switch child device.
   - `smartlife.cam.ipcamera.switch.get_is_enable` — produces a "<camera> Privacy Mode"
-    switch child device, inverted: on means `set_is_enable` `off`. A turned-off camera
-    keeps its stream port open but answers HTTP 503.
+    switch child device, inverted: on means `set_is_enable` `off`, and adds `PrivacyMode`
+    to the camera's own interfaces. A turned-off camera keeps its stream port open but
+    answers HTTP 503.
   - `smartlife.cam.ipcamera.led.get_status` — drives the camera's own `OnOff` so HomeKit
     can bind its `CameraOperatingModeIndicator` (a.k.a. "Status Light") characteristic to
     it. Enable **Link Status Indicator** in the HomeKit plugin's per-camera settings to
