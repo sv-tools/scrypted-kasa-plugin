@@ -835,6 +835,7 @@ class KasaCamera
             '```',
             renderKv([
                 ['Model', info.model || '?'],
+                ['Hardware', info.version || '?'],
                 ['Firmware', info.firmware || '?'],
                 ['Serial', info.serialNumber || '?'],
                 ['MAC', formatKasaMac(info.mac)],
@@ -1344,9 +1345,17 @@ interface KasaDiscoveryEntry {
     timeout: NodeJS.Timeout;
 }
 
+// Kasa reports the hardware revision as sysinfo.hw_ver ("1.0", "2.0", ...). It is published
+// as DeviceInformation.version, which HomeKit surfaces as Hardware Revision.
+function sysinfoHwVer(device: KasaDiscoveredDevice): string | undefined {
+    const v = device.sysinfo?.hw_ver;
+    return typeof v === 'string' && v.trim() ? v : undefined;
+}
+
 interface InventoryEntry {
     name: string;
     model: string;
+    hardware: string;
     firmware: string;
     ip: string;
     mac: string;
@@ -1382,6 +1391,23 @@ class KasaPlugin
         // the Readme tab actually shows on the device page. Defer to next tick so the SDK
         // is fully wired before we walk the device manager.
         process.nextTick(() => this.migrateAddReadme().catch(e => this.console.warn('migrateAddReadme failed', e)));
+        process.nextTick(() =>
+            this.backfillHardwareVersion().catch(e => this.console.warn('backfillHardwareVersion failed', e)),
+        );
+    }
+
+    // Devices adopted before the hardware version was recorded only get it from a refresh.
+    // Run that sweep once per install instead of on every start: devices that never answer
+    // discovery (offline, other subnet) would otherwise trigger a sweep on each restart.
+    private async backfillHardwareVersion(): Promise<void> {
+        if (this.storage.getItem('hardwareVersionBackfilled')) return;
+        const needs = deviceManager.getNativeIds().some(nativeId => {
+            if (!nativeId || isCameraChildNativeId(nativeId)) return false;
+            const state = deviceManager.getDeviceState(nativeId);
+            return !!state && !state.info?.version;
+        });
+        if (needs) await this.refreshAllDevices();
+        this.storage.setItem('hardwareVersionBackfilled', 'true');
     }
 
     // Plugin Settings tab — single button that re-runs UDP discovery and refreshes the
@@ -1393,7 +1419,7 @@ class KasaPlugin
                 key: 'refresh',
                 title: 'Refresh devices',
                 description:
-                    'Re-run UDP discovery and update model, firmware, IP, and MAC for every adopted ' +
+                    'Re-run UDP discovery and update model, hardware version, firmware, IP, and MAC for every adopted ' +
                     'Kasa device. Devices not currently reachable on the LAN are skipped.',
                 type: 'button',
             },
@@ -1408,8 +1434,8 @@ class KasaPlugin
     // overlapping discovery sweeps. Same pattern as scanInFlight in discoverDevices.
     private refreshInFlight?: Promise<void>;
 
-    // Re-run UDP discovery and update each adopted device's `info` (model, firmware, IP,
-    // MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
+    // Re-run UDP discovery and update each adopted device's `info` (model, hardware
+    // version, firmware, IP, MAC) from the fresh sysinfo response. Devices that don't respond to the sweep
     // (powered off, on a different subnet) are left alone — we don't want to clobber
     // good cached data with a one-shot network blip.
     private async refreshAllDevices(): Promise<void> {
@@ -1479,6 +1505,7 @@ class KasaPlugin
                 // address is the whole point of the refresh.
                 ip: fresh.address,
                 firmware: preferStr(sw_ver, existing.firmware),
+                version: preferStr(sysinfoHwVer(fresh), existing.version),
             };
 
             // Re-publish without touching providedInterfaces — refreshing metadata, not
@@ -1563,11 +1590,18 @@ class KasaPlugin
             if (!state) continue;
 
             const type = state.type as ScryptedDeviceType | undefined;
-            const info = (state.info || {}) as { model?: string; firmware?: string; ip?: string; mac?: string };
+            const info = (state.info || {}) as {
+                model?: string;
+                version?: string;
+                firmware?: string;
+                ip?: string;
+                mac?: string;
+            };
             const storedIp = deviceManager.getDeviceStorage(nativeId)?.getItem('ip');
             const entry: InventoryEntry = {
                 name: state.name || '<unknown>',
                 model: info.model || '?',
+                hardware: info.version || '?',
                 firmware: info.firmware || '?',
                 ip: storedIp || info.ip || '?',
                 mac: info.mac || '?',
@@ -1593,7 +1627,7 @@ class KasaPlugin
         const groups = this.inventory();
         const lines: string[] = ['# Kasa Plugin', '', 'Adopted devices, grouped by type.', ''];
 
-        const headers = ['Name', 'Model', 'IP', 'MAC', 'Firmware'];
+        const headers = ['Name', 'Model', 'HW', 'IP', 'MAC', 'Firmware'];
         let total = 0;
         for (const groupName of INVENTORY_GROUPS) {
             const entries = groups[groupName];
@@ -1602,7 +1636,7 @@ class KasaPlugin
 
             const rows: string[][] = [
                 headers,
-                ...entries.map(e => [e.name, e.model, e.ip, formatKasaMac(e.mac), e.firmware]),
+                ...entries.map(e => [e.name, e.model, e.hardware, e.ip, formatKasaMac(e.mac), e.firmware]),
             ];
             // Compute per-column widths so columns line up cleanly inside the code block.
             const widths = headers.map((_, col) => Math.max(...rows.map(r => r[col].length)));
@@ -1716,7 +1750,14 @@ class KasaPlugin
         nativeId: string,
         name: string,
         room?: string,
-        info?: { model?: string; mac?: string; ip?: string; serialNumber?: string; firmware?: string },
+        info?: {
+            model?: string;
+            mac?: string;
+            ip?: string;
+            serialNumber?: string;
+            firmware?: string;
+            version?: string;
+        },
     ): Promise<void> {
         const device: Device = {
             nativeId,
@@ -1741,6 +1782,7 @@ class KasaPlugin
                 ip: info?.ip || undefined,
                 serialNumber: info?.serialNumber || undefined,
                 firmware: info?.firmware || undefined,
+                version: info?.version || undefined,
             },
             // Empty string would clear the room on re-discovery; pass undefined to leave alone.
             room: room || undefined,
@@ -1966,6 +2008,7 @@ class KasaPlugin
             ip: device.address,
             serialNumber: device.deviceId,
             firmware: typeof device.sysinfo?.sw_ver === 'string' ? device.sysinfo.sw_ver : undefined,
+            version: sysinfoHwVer(device),
         });
         deviceManager.getDeviceStorage(nativeId).setItem('kasaClass', 'camera');
         const camera = (await this.getDevice(nativeId)) as KasaCamera;
@@ -2028,6 +2071,7 @@ class KasaPlugin
                 ip: device.address,
                 serialNumber: device.deviceId,
                 firmware: sw_ver,
+                version: sysinfoHwVer(device),
             },
         });
 
