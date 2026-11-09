@@ -1,17 +1,13 @@
 import crypto from 'crypto';
 import https from 'https';
 import { xorDecryptInPlace, xorEncryptInPlace } from '../shared/cipher';
+import { kasaControlAuth, markStaleSocket, retryStaleSocketOnce } from './http';
 
 export const KASA_LINKIE_PORT = 10443;
 const KASA_LINKIE_PATH = '/data/LINKIE2.json';
 const KASA_LINKIE_TIMEOUT_MS = 5000;
-
-// Same auth quirk as the talk channel: the camera wants md5_hex(plaintext) as the password.
-// (The receive endpoint takes base64(plaintext) instead — same camera, three different
-// places, three subtly different conventions.)
-function md5Hex(plaintext: string): string {
-    return crypto.createHash('md5').update(plaintext, 'utf8').digest('hex');
-}
+// Every module this plugin calls lives under this prefix.
+const KASA_LINKIE_MODULE_PREFIX = 'smartlife.cam.ipcamera.';
 
 export interface KasaLinkieOptions {
     ip: string;
@@ -63,11 +59,17 @@ export class KasaLinkieClient {
     // session takes a call from ~500 ms to ~30 ms. maxSockets 1 also queues concurrent callers
     // (a poll racing a settings probe): parallel calls to one camera occasionally drop responses.
     private agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
+    // Sent pre-emptively: the camera does not respond at all to unauthenticated requests (no
+    // 401, no anything), so waiting for a challenge would just hang. Built once; a client is
+    // replaced, not edited, when the credentials change.
+    private readonly auth: string;
 
     constructor(
-        public options: KasaLinkieOptions,
+        public readonly options: KasaLinkieOptions,
         public logger?: KasaLinkieClientLogger,
-    ) {}
+    ) {
+        this.auth = kasaControlAuth(options.username, options.password);
+    }
 
     // Closes the kept-alive connection. The socket belongs to the host Node process, so a
     // replaced or released client would otherwise hold it open until the camera drops it.
@@ -85,14 +87,6 @@ export class KasaLinkieClient {
         const encrypted = xorEncryptInPlace(Buffer.from(json, 'utf8'));
         const formBody = Buffer.from(`content=${encodeURIComponent(encrypted.toString('base64'))}`);
 
-        // Send Basic auth pre-emptively. The camera does not respond at all to unauthenticated
-        // requests (no 401, no anything), so the standard "wait for challenge then retry"
-        // pattern would just hang. Pre-emptive auth matches what curl with `-u` does.
-        const auth =
-            'Basic ' + Buffer.from(`${this.options.username}:${md5Hex(this.options.password)}`).toString('base64');
-
-        // `stale` marks a failure on a reused kept-alive socket that the camera had closed while
-        // idle; Node only learns that on the next write, so that one request is retried once.
         const send = () =>
             new Promise<Buffer>((resolve, reject) => {
                 const req = https.request(
@@ -106,7 +100,7 @@ export class KasaLinkieClient {
                         // Mirror the Kasa iOS app's headers — the camera gates /data/LINKIE2.json on the
                         // User-Agent (silently drops requests that don't look like the Kasa app).
                         headers: {
-                            Authorization: auth,
+                            Authorization: this.auth,
                             'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
                             'Content-Length': formBody.length,
                             'User-Agent': 'Kasa/1752 CFNetwork/3860.500.112 Darwin/25.4.0',
@@ -133,18 +127,11 @@ export class KasaLinkieClient {
                 req.setTimeout(KASA_LINKIE_TIMEOUT_MS, () => {
                     req.destroy(new Error(`kasa linkie request timeout after ${KASA_LINKIE_TIMEOUT_MS}ms`));
                 });
-                req.on('error', e => {
-                    const code = (e as NodeJS.ErrnoException).code;
-                    if (req.reusedSocket && (code === 'ECONNRESET' || code === 'EPIPE')) (e as any).stale = true;
-                    reject(e);
-                });
+                req.on('error', e => reject(markStaleSocket(req, e)));
                 req.write(formBody);
                 req.end();
             });
-        const respBuffer = await send().catch(e => {
-            if (!(e as any).stale) throw e;
-            return send();
-        });
+        const respBuffer = await retryStaleSocketOnce(send);
 
         const respB64 = respBuffer.toString('utf8').trim();
         // Same here: the base64-decoded buffer is freshly ours, decrypt in-place.
@@ -152,151 +139,101 @@ export class KasaLinkieClient {
         return JSON.parse(respDecrypted.toString('utf8'));
     }
 
-    // Spotlight controls under smartlife.cam.ipcamera.dayNight (called "force_lamp" at the
-    // protocol level, "spotlight" in the Kasa app UI).
-    // Returns 'on' / 'off' for cameras that support it, undefined for cameras that don't
-    // (request fails or the module is missing from the response).
+    // Calls one method of one module and returns that method's result object.
+    private async invoke(module: string, method: string, args: Record<string, any> = {}): Promise<any> {
+        const key = KASA_LINKIE_MODULE_PREFIX + module;
+        const r = await this.call({ [key]: { [method]: args } });
+        return r?.[key]?.[method];
+    }
 
-    async getForceLampState(): Promise<'on' | 'off' | undefined> {
+    // Reads an on/off value. Doubles as the feature probe: undefined means the camera doesn't
+    // have the feature (the module is missing from the response) or didn't answer.
+    private async getState(module: string, method: string): Promise<'on' | 'off' | undefined> {
         try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.dayNight': { get_force_lamp_state: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.dayNight']?.get_force_lamp_state?.value;
+            const v = (await this.invoke(module, method))?.value;
             return v === 'on' || v === 'off' ? v : undefined;
         } catch (e) {
-            this.logger?.warn?.('kasa linkie get_force_lamp_state failed:', (e as Error).message);
+            this.logger?.warn?.(`kasa linkie ${module} ${method} failed:`, (e as Error).message);
             return undefined;
         }
     }
 
-    async setForceLampState(on: boolean): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.dayNight': {
-                set_force_lamp_state: { value: on ? 'on' : 'off' },
-            },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.dayNight']?.set_force_lamp_state?.err_code;
-        if (errCode !== 0) throw new Error(`set_force_lamp_state err_code=${errCode}`);
+    private async command(module: string, method: string, args: Record<string, any> = {}): Promise<void> {
+        const errCode = (await this.invoke(module, method, args))?.err_code;
+        if (errCode !== 0) throw new KasaLinkieError(`${module} ${method} err_code=${errCode}`, errCode);
     }
 
-    // Status LED on the camera body, controlled via smartlife.cam.ipcamera.led. Used to
-    // back HomeKit's CameraOperatingModeIndicator characteristic via OnOff on the camera.
-
-    async getLedStatus(): Promise<'on' | 'off' | undefined> {
-        try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.led': { get_status: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.led']?.get_status?.value;
-            return v === 'on' || v === 'off' ? v : undefined;
-        } catch (e) {
-            this.logger?.warn?.('kasa linkie get_status (led) failed:', (e as Error).message);
-            return undefined;
-        }
+    private setState(module: string, method: string, on: boolean): Promise<void> {
+        return this.command(module, method, { value: on ? 'on' : 'off' });
     }
 
-    async setLedStatus(on: boolean): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.led': {
-                set_status: { value: on ? 'on' : 'off' },
-            },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.led']?.set_status?.err_code;
-        if (errCode !== 0) throw new Error(`led set_status err_code=${errCode}`);
+    // Spotlight, under dayNight (called "force_lamp" at the protocol level, "spotlight" in the
+    // Kasa app UI).
+    getForceLampState(): Promise<'on' | 'off' | undefined> {
+        return this.getState('dayNight', 'get_force_lamp_state');
     }
 
-    // Siren under smartlife.cam.ipcamera.siren. The camera auto-stops after the duration
-    // configured in the Kasa app (default 30 s); we just send on/off and let the camera
-    // handle the timer.
-
-    async getSirenState(): Promise<'on' | 'off' | undefined> {
-        try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.siren': { get_state: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.siren']?.get_state?.value;
-            return v === 'on' || v === 'off' ? v : undefined;
-        } catch (e) {
-            this.logger?.warn?.('kasa linkie get_state (siren) failed:', (e as Error).message);
-            return undefined;
-        }
+    setForceLampState(on: boolean): Promise<void> {
+        return this.setState('dayNight', 'set_force_lamp_state', on);
     }
 
-    async setSirenState(on: boolean): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.siren': {
-                set_state: { value: on ? 'on' : 'off' },
-            },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.siren']?.set_state?.err_code;
-        if (errCode !== 0) throw new Error(`siren set_state err_code=${errCode}`);
+    // Status LED on the camera body. Backs HomeKit's CameraOperatingModeIndicator
+    // characteristic via OnOff on the camera.
+    getLedStatus(): Promise<'on' | 'off' | undefined> {
+        return this.getState('led', 'get_status');
     }
 
-    // The camera's own on/off ("camera off" in the Kasa app), under smartlife.cam.ipcamera.switch.
-    // Off stops video for every client, not just HomeKit: the stream port stays open but answers
-    // HTTP 503 until it's turned back on, and the next stream attempt after that succeeds.
-
-    async getCameraEnabled(): Promise<'on' | 'off' | undefined> {
-        try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.switch': { get_is_enable: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.switch']?.get_is_enable?.value;
-            return v === 'on' || v === 'off' ? v : undefined;
-        } catch (e) {
-            this.logger?.warn?.('kasa linkie get_is_enable (switch) failed:', (e as Error).message);
-            return undefined;
-        }
+    setLedStatus(on: boolean): Promise<void> {
+        return this.setState('led', 'set_status', on);
     }
 
-    async setCameraEnabled(on: boolean): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.switch': {
-                set_is_enable: { value: on ? 'on' : 'off' },
-            },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.switch']?.set_is_enable?.err_code;
-        if (errCode !== 0) throw new Error(`switch set_is_enable err_code=${errCode}`);
+    // Siren. The camera auto-stops after the duration configured in the Kasa app (default
+    // 30 s); we just send on/off and let the camera handle the timer.
+    getSirenState(): Promise<'on' | 'off' | undefined> {
+        return this.getState('siren', 'get_state');
     }
 
-    // Reboot under smartlife.cam.ipcamera.system. Found by probing (not in any published
-    // client): `reboot` answers -10008, `set_reboot` is the real one. The camera drops off the
-    // network ~20 s later and is back with all ports open after ~30 s. Useful when the stream
-    // server on :19443 dies while the control plane stays up (connection refused on stream
-    // only) — that state otherwise needs a power cycle.
-    async reboot(): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.system': { set_reboot: {} },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.system']?.set_reboot?.err_code;
-        if (errCode !== 0) throw new Error(`system set_reboot err_code=${errCode}`);
+    setSirenState(on: boolean): Promise<void> {
+        return this.setState('siren', 'set_state', on);
     }
 
-    // Pan/tilt under smartlife.cam.ipcamera.ptz (KC410S "Spot Pan Tilt" and siblings).
-    // Fixed-lens models answer every ptz method with -10008 "Unsupported API call", so a
-    // successful get_capability doubles as the feature probe.
+    // The camera's own on/off ("camera off" in the Kasa app), under switch. Off stops video for
+    // every client, not just HomeKit: the stream port stays open but answers HTTP 503 until
+    // it's turned back on, and the next stream attempt after that succeeds.
+    getCameraEnabled(): Promise<'on' | 'off' | undefined> {
+        return this.getState('switch', 'get_is_enable');
+    }
 
+    setCameraEnabled(on: boolean): Promise<void> {
+        return this.setState('switch', 'set_is_enable', on);
+    }
+
+    // Reboot, under system. Found by probing (not in any published client): `reboot` answers
+    // -10008, `set_reboot` is the real one. The camera drops off the network ~20 s later and is
+    // back with all ports open after ~30 s. Useful when the stream server on :19443 dies while
+    // the control plane stays up (connection refused on stream only) — that state otherwise
+    // needs a power cycle.
+    reboot(): Promise<void> {
+        return this.command('system', 'set_reboot');
+    }
+
+    // Pan/tilt, under ptz (KC410S "Spot Pan Tilt" and siblings). Fixed-lens models answer every
+    // ptz method with -10008 "Unsupported API call", so a successful get_capability doubles as
+    // the feature probe.
     async getPtzCapability(): Promise<KasaPtzCapability | undefined> {
         try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.ptz': { get_capability: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.ptz']?.get_capability;
+            const v = await this.invoke('ptz', 'get_capability');
             if (v?.err_code !== 0 || typeof v.max_x !== 'number' || typeof v.max_y !== 'number') return undefined;
             return { maxX: v.max_x, maxY: v.max_y };
         } catch (e) {
-            this.logger?.warn?.('kasa linkie get_capability (ptz) failed:', (e as Error).message);
+            this.logger?.warn?.('kasa linkie ptz get_capability failed:', (e as Error).message);
             return undefined;
         }
     }
 
     async getPtzPresets(): Promise<KasaPtzPreset[]> {
         try {
-            const r = await this.call({
-                'smartlife.cam.ipcamera.ptz': { get_all_preset: {} },
-            });
-            const v = r?.['smartlife.cam.ipcamera.ptz']?.get_all_preset;
+            const v = await this.invoke('ptz', 'get_all_preset');
             if (v?.err_code !== 0 || !Array.isArray(v.preset_attr)) return [];
             // Entry shape isn't documented anywhere we've found. set_run_to_preset takes a
             // 1-based index (the Kasa app's "viewpoint" number), so fall back to position when
@@ -307,48 +244,35 @@ export class KasaLinkieClient {
                 return { index, name };
             });
         } catch (e) {
-            this.logger?.warn?.('kasa linkie get_all_preset (ptz) failed:', (e as Error).message);
+            this.logger?.warn?.('kasa linkie ptz get_all_preset failed:', (e as Error).message);
             return [];
         }
     }
 
     // `speed` is the step size, not a rate: each call moves one discrete step (1 ≈ 50 units,
-    // 10 ≈ 333 units on the tilt axis) and the camera stops on its own. 0 or >10 is rejected.
-    async ptzMove(direction: KasaPtzDirection, speed: number): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.ptz': { set_move: { direction, speed } },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.ptz']?.set_move?.err_code;
-        // -41203 covers both a bad value and an axis already at its end stop.
-        if (errCode !== 0) throw new Error(`ptz set_move ${direction} err_code=${errCode}`);
+    // 10 ≈ 333 units on the tilt axis) and the camera stops on its own. 0 or >10 is rejected
+    // with -41203, which also covers an axis already at its end stop.
+    ptzMove(direction: KasaPtzDirection, speed: number): Promise<void> {
+        return this.command('ptz', 'set_move', { direction, speed });
     }
 
-    // The camera's own motion detection, under smartlife.cam.ipcamera.vod. The firmware wants
-    // `timestamp` (Unix seconds, after 2019-05-01) directly in the method object, and reports a
-    // missing one as "The parameter [start_time] is required." (-40700), which is misleading.
+    ptzRunToPreset(index: number): Promise<void> {
+        return this.command('ptz', 'set_run_to_preset', { index });
+    }
+
+    // The camera's own motion detection, under vod. The firmware wants `timestamp` (Unix
+    // seconds, after 2019-05-01) directly in the method object, and reports a missing one as
+    // "The parameter [start_time] is required." (-40700), which is misleading.
     // is_moving is true while an alarm fired within the last ~2 s: motion, person, baby cry, or a
     // doorbell ring (sound alarms excluded). There is no push or long-poll; callers poll.
     // The timestamp only feeds the SD-recording flags (is_video_ready / is_event_finish).
     async getMotionDetected(): Promise<boolean> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.vod': {
-                get_detect_event_state: { timestamp: Math.floor(Date.now() / 1000) },
-            },
-        });
-        const v = r?.['smartlife.cam.ipcamera.vod']?.get_detect_event_state;
+        const v = await this.invoke('vod', 'get_detect_event_state', { timestamp: Math.floor(Date.now() / 1000) });
         if (v?.err_code !== 0)
             throw new KasaLinkieError(
-                `get_detect_event_state err_code=${v?.err_code} ${v?.err_msg || ''}`,
+                `vod get_detect_event_state err_code=${v?.err_code} ${v?.err_msg || ''}`,
                 v?.err_code,
             );
         return v.is_moving === true;
-    }
-
-    async ptzRunToPreset(index: number): Promise<void> {
-        const r = await this.call({
-            'smartlife.cam.ipcamera.ptz': { set_run_to_preset: { index } },
-        });
-        const errCode = r?.['smartlife.cam.ipcamera.ptz']?.set_run_to_preset?.err_code;
-        if (errCode !== 0) throw new Error(`ptz set_run_to_preset ${index} err_code=${errCode}`);
     }
 }
