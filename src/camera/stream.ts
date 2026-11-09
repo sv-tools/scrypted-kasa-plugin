@@ -1,7 +1,7 @@
 import net from 'net';
 import { findSpsPps, KasaClient, KasaMimeG711U, KasaMimeVideo, KasaPart } from './api';
 import { G711_CLOCK_HZ, G711RtpPacketizer, H264_CLOCK_HZ, H264RtpPacketizer, nowNtp } from './rtp';
-import { handleRtspClient } from './rtsp';
+import { handleRtspClient, RTSP_INTERLEAVED_HEADER_LEN } from './rtsp';
 
 // Process-level cleanup registry. Scrypted runs plugins as worker threads; resources
 // owned by the host Node process (TCP servers, kasa HTTPS connections) survive worker
@@ -34,11 +34,6 @@ export function registerLiveCleanup(cleanup: () => void): () => void {
 // we don't see them in this window the camera is misbehaving and there's no point holding
 // the call.
 const SPS_PPS_TIMEOUT_MS = 10000;
-// Belt-and-suspenders caps on the prebuffer. The timeout already bounds the wait, but a
-// camera that streams at high bitrate and never emits SPS/PPS could fill memory before the
-// timer fires. Either trip throws.
-const SPS_PPS_MAX_BUFFERED_PARTS = 1024;
-const SPS_PPS_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 
 export interface KasaStreamOptions {
     kasa: KasaClient;
@@ -87,36 +82,20 @@ function buildSdp(sps: Buffer, pps: Buffer): string {
     );
 }
 
-async function preScanSpsPps(kasa: KasaClient): Promise<{ sps: Buffer; pps: Buffer; buffered: KasaPart[] }> {
-    const buffered: KasaPart[] = [];
-    let bufferedBytes = 0;
+// Reads parts until the bitstream has shown both SPS and PPS. The parts themselves are not
+// kept: no RTSP client can be connected yet (the server isn't listening), so there is nobody
+// to replay them to, and the consumer starts decoding at the next IDR anyway.
+async function preScanSpsPps(kasa: KasaClient): Promise<{ sps: Buffer; pps: Buffer }> {
     const found: { sps?: Buffer; pps?: Buffer } = {};
     const deadline = Date.now() + SPS_PPS_TIMEOUT_MS;
     while (!found.sps || !found.pps) {
         if (Date.now() > deadline) throw new Error('timed out waiting for H.264 SPS/PPS');
-        if (buffered.length >= SPS_PPS_MAX_BUFFERED_PARTS)
-            throw new Error(`H.264 SPS/PPS not found within ${SPS_PPS_MAX_BUFFERED_PARTS} parts`);
-        if (bufferedBytes >= SPS_PPS_MAX_BUFFERED_BYTES)
-            throw new Error(`H.264 SPS/PPS not found within ${SPS_PPS_MAX_BUFFERED_BYTES} prebuffered bytes`);
         const part = await kasa.readPart();
-        buffered.push(part);
-        bufferedBytes += part.body.length;
         if (part.contentType === KasaMimeVideo) findSpsPps(part.body, found);
     }
-    return { sps: found.sps!, pps: found.pps!, buffered };
-}
-
-// Reserve a TCP port on localhost for the RTSP server. Brief TOCTOU window between close
-// and re-bind is accepted — nothing else snatches loopback ports in those few ms.
-async function reserveTcpPort(): Promise<number> {
-    return new Promise<number>((resolve, reject) => {
-        const probe = net.createServer();
-        probe.once('error', reject);
-        probe.listen(0, '127.0.0.1', () => {
-            const port = (probe.address() as net.AddressInfo).port;
-            probe.close(() => resolve(port));
-        });
-    });
+    // Copies: findSpsPps returns views into the part, so a caller that keeps them would
+    // otherwise pin the whole IDR (80+ KB).
+    return { sps: Buffer.from(found.sps), pps: Buffer.from(found.pps) };
 }
 
 // Compute an RTP timestamp at `clockHz` from a process.hrtime delta in nanoseconds.
@@ -161,16 +140,11 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
 
     let sps: Buffer;
     let pps: Buffer;
-    let buffered: KasaPart[];
     if (cacheValid) {
         sps = cachedSps!;
         pps = cachedPps!;
-        buffered = [];
     } else {
-        const scanned = await preScanSpsPps(kasa);
-        sps = scanned.sps;
-        pps = scanned.pps;
-        buffered = scanned.buffered;
+        ({ sps, pps } = await preScanSpsPps(kasa));
         try {
             onFreshSpsPps?.(sps, pps);
         } catch (e) {
@@ -179,9 +153,10 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     }
     const sdp = buildSdp(sps, pps);
 
-    // Packetizers carry seq + SSRC across the whole session.
-    const h264 = new H264RtpPacketizer();
-    const g711 = new G711RtpPacketizer();
+    // Packetizers carry seq + SSRC across the whole session. Each packet is allocated with
+    // room in front for the RTSP interleaved header, so sending it doesn't copy it again.
+    const h264 = new H264RtpPacketizer(RTSP_INTERLEAVED_HEADER_LEN);
+    const g711 = new G711RtpPacketizer(RTSP_INTERLEAVED_HEADER_LEN);
 
     // Active forwarder — populated when the RTSP client PLAYs, cleared on teardown.
     interface ActiveForwarder {
@@ -236,8 +211,6 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     // queued bytes cross a hard cap. From here we just call send and let it decide.
     const pump = async () => {
         const t0 = process.hrtime.bigint();
-        const replay = buffered;
-        buffered = [];
         // Audio RTP timestamps must advance by sample count, not wall-clock — RTP
         // receivers use the timestamp to drive playout, and any wall-clock-derived jitter
         // would surface as audible discontinuities. Initialize once on first audio part
@@ -263,10 +236,6 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
         };
 
         try {
-            for (const part of replay) handlePart(part);
-            // Release prebuffered parts (up to a few hundred KB each) — they were captured
-            // during the SPS/PPS scan and are only needed for this single replay.
-            replay.length = 0;
             while (!killed) {
                 const part = await kasa.readPart();
                 handlePart(part);
@@ -280,9 +249,6 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     void pump();
 
     // Bind the RTSP listener last, after all the supporting pieces are in place.
-    const rtspPort = await reserveTcpPort();
-    const url = `rtsp://127.0.0.1:${rtspPort}/kasa`;
-
     tcpServer = net.createServer();
 
     tcpServer.on('connection', client => {
@@ -331,12 +297,21 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     });
 
     await new Promise<void>((resolve, reject) => {
+        let listening = false;
         tcpServer!.once('error', reject);
-        tcpServer!.listen(rtspPort, '127.0.0.1', () => {
+        tcpServer!.listen(0, '127.0.0.1', () => {
+            listening = true;
             tcpServer!.removeListener('error', reject);
             resolve();
         });
+        // The pump is already running and can end the stream first (the camera closed the
+        // body, or the first part was malformed). close() in cleanupAll cancels a pending
+        // listen without emitting 'listening' or 'error', so nothing above would settle.
+        void exited.then(() => {
+            if (!listening) reject(new Error('kasa stream ended before the RTSP server started'));
+        });
     });
+    const url = `rtsp://127.0.0.1:${(tcpServer.address() as net.AddressInfo).port}/kasa`;
 
     return {
         url,

@@ -1,4 +1,3 @@
-import { once } from 'events';
 import https from 'https';
 import type { IncomingMessage } from 'http';
 import type { Readable } from 'stream';
@@ -353,6 +352,31 @@ async function readLength(readable: Readable, length: number): Promise<Buffer> {
     });
 }
 
+// Resolves at the next 'readable', or when the stream ends, closes or fails; the caller loops
+// and re-checks the stream, so one that is already finished can't strand it. Plain listeners,
+// all removed on the first event: this runs for nearly every part (~80 times a second per
+// camera), and leftover listeners would pile up over a long stream.
+//
+// Only for a caller that has just drained the stream with read(): attaching a 'readable'
+// listener while data is still buffered makes Node emit 'readable' again at once, and a loop
+// around that never yields to I/O. readLength, which waits with data buffered, keeps its
+// listener attached instead.
+function waitReadable(readable: Readable): Promise<void> {
+    return new Promise<void>(resolve => {
+        const done = () => {
+            readable.removeListener('readable', done);
+            readable.removeListener('end', done);
+            readable.removeListener('close', done);
+            readable.removeListener('error', done);
+            resolve();
+        };
+        readable.on('readable', done);
+        readable.on('end', done);
+        readable.on('close', done);
+        readable.on('error', done);
+    });
+}
+
 // Read up to and including the first blank line (CRLF CRLF or LF LF) and return everything
 // up to and including the terminator as a Buffer. Whatever bytes come after are unshifted
 // back so the body that follows can be read intact. Enforces MAX_HEADER_BYTES so a malformed
@@ -368,26 +392,7 @@ async function readUntilDoubleCrlf(readable: Readable): Promise<Buffer> {
         if (readable.readableEnded || readable.destroyed) throw new Error('kasa stream ended before headers');
         const chunk: Buffer | null = readable.read();
         if (!chunk) {
-            // Race 'readable' against 'end'/'close'/'error': if the stream has already ended
-            // (or terminates while we're waiting), 'readable' will never fire and the await
-            // would strand this promise forever. Re-checking readableEnded on the next loop
-            // turn lets us throw a real error instead of hanging.
-            //
-            // AbortController removes the losing once() listeners; without it each iteration
-            // would leave 2 dangling listeners attached for the lifetime of the stream and
-            // eventually trip MaxListenersExceededWarning on a long stream with many parts.
-            const ac = new AbortController();
-            try {
-                await Promise.race([
-                    once(readable, 'readable', { signal: ac.signal }).catch(() => {
-                        /* aborted or end */
-                    }),
-                    once(readable, 'end', { signal: ac.signal }).catch(() => {}),
-                    once(readable, 'close', { signal: ac.signal }).catch(() => {}),
-                ]);
-            } finally {
-                ac.abort();
-            }
+            await waitReadable(readable);
             continue;
         }
         let split = -1;

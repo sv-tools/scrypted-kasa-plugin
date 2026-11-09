@@ -40,13 +40,15 @@ export function nowNtp(): NtpTime {
 }
 
 function writeSenderReport(
+    headroom: number,
     ssrc: number,
     ntp: NtpTime,
     rtpTimestamp: number,
     packetCount: number,
     octetCount: number,
 ): Buffer {
-    const buf = Buffer.allocUnsafe(RTCP_SR_LEN);
+    const out = Buffer.allocUnsafe(headroom + RTCP_SR_LEN);
+    const buf = out.subarray(headroom);
     // V=2, P=0, RC=0 → 0b10_0_00000 = 0x80
     buf[0] = RTP_VERSION << 6;
     buf[1] = RTCP_PT_SR;
@@ -58,7 +60,7 @@ function writeSenderReport(
     buf.writeUInt32BE(rtpTimestamp >>> 0, 16);
     buf.writeUInt32BE(packetCount >>> 0, 20);
     buf.writeUInt32BE(octetCount >>> 0, 24);
-    return buf;
+    return out;
 }
 
 // FU-A fragmentation cutoff. We serve via RTSP/TCP-interleaved (no MTU constraint),
@@ -73,19 +75,24 @@ const FU_A_HEADER_OVERHEAD = 2;
 // packet, the standard sizing in RFC 3551.
 const G711_SAMPLES_PER_PACKET = 160;
 
-function writeRtpHeader(
-    buf: Buffer,
+// Allocates a packet of `headroom` spare bytes + RTP header + `payloadLen` payload bytes and
+// writes the header. The caller fills the payload, which starts at headroom + RTP_HEADER_LEN.
+function allocRtpPacket(
+    headroom: number,
+    payloadLen: number,
     payloadType: number,
     seq: number,
     timestamp: number,
     ssrc: number,
     marker: boolean,
-): void {
-    buf[0] = RTP_VERSION << 6;
-    buf[1] = (marker ? 0x80 : 0) | (payloadType & 0x7f);
-    buf.writeUInt16BE(seq & 0xffff, 2);
-    buf.writeUInt32BE(timestamp >>> 0, 4);
-    buf.writeUInt32BE(ssrc >>> 0, 8);
+): Buffer {
+    const buf = Buffer.allocUnsafe(headroom + RTP_HEADER_LEN + payloadLen);
+    buf[headroom] = RTP_VERSION << 6;
+    buf[headroom + 1] = (marker ? 0x80 : 0) | (payloadType & 0x7f);
+    buf.writeUInt16BE(seq & 0xffff, headroom + 2);
+    buf.writeUInt32BE(timestamp >>> 0, headroom + 4);
+    buf.writeUInt32BE(ssrc >>> 0, headroom + 8);
+    return buf;
 }
 
 // Yields each NAL unit body (without the start code) found in an annex-b H.264 buffer.
@@ -120,20 +127,33 @@ export function* annexbNalUnits(annexb: Buffer): IterableIterator<Buffer> {
 
 export type RtpSink = (packet: Buffer) => void;
 
-// One packetizer per stream session — owns the seq counter and SSRC. RTP requires both
-// to be stable across all packets of a stream, with seq monotonically increasing.
-export class H264RtpPacketizer {
-    private seq: number;
-    private packetCount = 0;
-    private octetCount = 0;
-    private lastTimestamp = 0;
-    readonly ssrc: number;
+// What the two packetizers share: the seq counter and SSRC (RTP requires both to be stable
+// across all packets of a stream, with seq monotonically increasing) and the counters an RTCP
+// Sender Report carries. One packetizer per stream session.
+//
+// `headroom` is a number of spare bytes left at the front of every packet handed to the sink,
+// for a transport that prepends its own framing (RTSP interleaved) to fill in without copying
+// the packet. Sender Reports get the same headroom.
+abstract class RtpPacketizer {
+    protected seq = randomBytes(2).readUInt16BE(0);
+    protected packetCount = 0;
+    protected octetCount = 0;
+    protected lastTimestamp = 0;
+    readonly ssrc = randomBytes(4).readUInt32BE(0);
 
-    constructor() {
-        this.seq = randomBytes(2).readUInt16BE(0);
-        this.ssrc = randomBytes(4).readUInt32BE(0);
+    constructor(protected readonly headroom = 0) {}
+
+    // Build an RTCP Sender Report describing the latest emission. `ntp` should be sampled
+    // close to the moment of the SR's wire emission so the NTP↔RTP timestamp pair stays
+    // accurate. Returns undefined when no packets have been emitted yet — receivers can
+    // tolerate a missing first SR, and emitting one with all zeros confuses jitter math.
+    senderReport(ntp: NtpTime): Buffer | undefined {
+        if (this.packetCount === 0) return;
+        return writeSenderReport(this.headroom, this.ssrc, ntp, this.lastTimestamp, this.packetCount, this.octetCount);
     }
+}
 
+export class H264RtpPacketizer extends RtpPacketizer {
     // Emits RTP packets for one access unit. All packets share `timestamp` (90 kHz),
     // and the marker bit is set on the last packet of the AU per RFC 6184 § 5.1. Caller
     // typically passes one annex-b buffer per video part = one AU.
@@ -146,10 +166,18 @@ export class H264RtpPacketizer {
             const nal = nals[i];
             const isLastNal = i === nals.length - 1;
 
+            const payloadStart = this.headroom + RTP_HEADER_LEN;
             if (nal.length <= RTP_PAYLOAD_MTU) {
-                const pkt = Buffer.allocUnsafe(RTP_HEADER_LEN + nal.length);
-                writeRtpHeader(pkt, PT_H264, this.seq++, timestamp, this.ssrc, isLastNal);
-                nal.copy(pkt, RTP_HEADER_LEN);
+                const pkt = allocRtpPacket(
+                    this.headroom,
+                    nal.length,
+                    PT_H264,
+                    this.seq++,
+                    timestamp,
+                    this.ssrc,
+                    isLastNal,
+                );
+                nal.copy(pkt, payloadStart);
                 sink(pkt);
                 this.packetCount++;
                 this.octetCount = (this.octetCount + nal.length) >>> 0;
@@ -172,11 +200,18 @@ export class H264RtpPacketizer {
                 const isFirstFu = offset === 0;
                 const isLastFu = take === remaining;
                 const fuHeader = (isFirstFu ? 0x80 : 0) | (isLastFu ? 0x40 : 0) | fuTypeBits;
-                const pkt = Buffer.allocUnsafe(RTP_HEADER_LEN + FU_A_HEADER_OVERHEAD + take);
-                writeRtpHeader(pkt, PT_H264, this.seq++, timestamp, this.ssrc, isLastNal && isLastFu);
-                pkt[RTP_HEADER_LEN] = fuIndicator;
-                pkt[RTP_HEADER_LEN + 1] = fuHeader;
-                payload.copy(pkt, RTP_HEADER_LEN + FU_A_HEADER_OVERHEAD, offset, offset + take);
+                const pkt = allocRtpPacket(
+                    this.headroom,
+                    FU_A_HEADER_OVERHEAD + take,
+                    PT_H264,
+                    this.seq++,
+                    timestamp,
+                    this.ssrc,
+                    isLastNal && isLastFu,
+                );
+                pkt[payloadStart] = fuIndicator;
+                pkt[payloadStart + 1] = fuHeader;
+                payload.copy(pkt, payloadStart + FU_A_HEADER_OVERHEAD, offset, offset + take);
                 sink(pkt);
                 this.packetCount++;
                 this.octetCount = (this.octetCount + FU_A_HEADER_OVERHEAD + take) >>> 0;
@@ -185,15 +220,6 @@ export class H264RtpPacketizer {
         }
         this.lastTimestamp = timestamp >>> 0;
     }
-
-    // Build an RTCP Sender Report describing the latest emission. `ntp` should be sampled
-    // close to the moment of the SR's wire emission so the NTP↔RTP timestamp pair stays
-    // accurate. Returns undefined when no packets have been emitted yet — receivers can
-    // tolerate a missing first SR, and emitting one with all zeros confuses jitter math.
-    senderReport(ntp: NtpTime): Buffer | undefined {
-        if (this.packetCount === 0) return;
-        return writeSenderReport(this.ssrc, ntp, this.lastTimestamp, this.packetCount, this.octetCount);
-    }
 }
 
 // G.711 µ-law packetizer — chunks a µ-law byte stream into 20 ms RTP packets. The caller
@@ -201,26 +227,14 @@ export class H264RtpPacketizer {
 // sample count internally to keep packet-to-packet timing exact regardless of how the
 // camera batched samples into multipart parts. Returns the next-sample timestamp so the
 // caller can chain across parts if it wants sample-accurate timing.
-export class G711RtpPacketizer {
-    private seq: number;
-    private packetCount = 0;
-    private octetCount = 0;
-    private lastTimestamp = 0;
-    readonly ssrc: number;
-
-    constructor() {
-        this.seq = randomBytes(2).readUInt16BE(0);
-        this.ssrc = randomBytes(4).readUInt32BE(0);
-    }
-
+export class G711RtpPacketizer extends RtpPacketizer {
     packetize(mulaw: Buffer, timestampStart: number, sink: RtpSink): number {
         let offset = 0;
         let ts = timestampStart >>> 0;
         while (offset < mulaw.length) {
             const take = Math.min(G711_SAMPLES_PER_PACKET, mulaw.length - offset);
-            const pkt = Buffer.allocUnsafe(RTP_HEADER_LEN + take);
-            writeRtpHeader(pkt, PT_PCMU, this.seq++, ts, this.ssrc, false);
-            mulaw.copy(pkt, RTP_HEADER_LEN, offset, offset + take);
+            const pkt = allocRtpPacket(this.headroom, take, PT_PCMU, this.seq++, ts, this.ssrc, false);
+            mulaw.copy(pkt, this.headroom + RTP_HEADER_LEN, offset, offset + take);
             sink(pkt);
             this.packetCount++;
             this.octetCount = (this.octetCount + take) >>> 0;
@@ -229,10 +243,5 @@ export class G711RtpPacketizer {
             offset += take;
         }
         return ts;
-    }
-
-    senderReport(ntp: NtpTime): Buffer | undefined {
-        if (this.packetCount === 0) return;
-        return writeSenderReport(this.ssrc, ntp, this.lastTimestamp, this.packetCount, this.octetCount);
     }
 }

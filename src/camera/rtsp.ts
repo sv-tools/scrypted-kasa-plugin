@@ -2,6 +2,8 @@ import { randomBytes } from 'crypto';
 import net from 'net';
 
 const RTSP_INTERLEAVED_MAGIC = 0x24; // '$'
+// Interleaved frame header: '$' + 1-byte channel + 2-byte BE length of what follows.
+export const RTSP_INTERLEAVED_HEADER_LEN = 4;
 
 export interface RtspChannelPair {
     rtp: number;
@@ -13,8 +15,11 @@ export interface RtspChannels {
     audio: RtspChannelPair;
 }
 
+// Sends one RTP/RTCP packet on an interleaved channel. `frame` must start with
+// RTSP_INTERLEAVED_HEADER_LEN spare bytes, which are overwritten with the frame header, so the
+// packet goes out in one write without being copied into a second buffer.
 export interface RtspSendInterleaved {
-    (channel: number, packet: Buffer): boolean;
+    (channel: number, frame: Buffer): boolean;
 }
 
 export interface RtspHandlerOptions {
@@ -65,7 +70,7 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
         opts.onTeardown();
     };
 
-    const send: RtspSendInterleaved = (channel, packet) => {
+    const send: RtspSendInterleaved = (channel, frame) => {
         if (client.destroyed) return false;
         // Cap check runs BEFORE the backpressured early-return: a single write that
         // pushes bufferSize over the cap will set backpressured=true on the way out, and
@@ -83,20 +88,15 @@ export function handleRtspClient(client: net.Socket, opts: RtspHandlerOptions): 
             return false;
         }
         if (backpressured) return false;
-        // Interleaved frame: '$' + 1-byte channel + 2-byte BE length + RTP packet bytes.
-        // Header + body in one Buffer to avoid splitting writes (a small write between the
-        // two would let an out-of-order chunk arrive in the middle of an interleaved frame).
-        const out = Buffer.allocUnsafe(4 + packet.length);
-        out[0] = RTSP_INTERLEAVED_MAGIC;
-        out[1] = channel;
-        out.writeUInt16BE(packet.length, 2);
-        packet.copy(out, 4);
+        frame[0] = RTSP_INTERLEAVED_MAGIC;
+        frame[1] = channel;
+        frame.writeUInt16BE(frame.length - RTSP_INTERLEAVED_HEADER_LEN, 2);
         // The destroyed check above is racy — the socket can be torn down between the
         // check and write (different microtask), in which case write throws
         // ERR_STREAM_DESTROYED. Catch it; the next packet's destroyed check will gate
         // further sends.
         try {
-            const ok = client.write(out);
+            const ok = client.write(frame);
             if (!ok) backpressured = true;
             return ok;
         } catch {
