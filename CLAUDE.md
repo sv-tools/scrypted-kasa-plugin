@@ -29,7 +29,7 @@ Single Scrypted plugin (`KasaPlugin`) that adopts two unrelated TP-Link Kasa dev
   - `:19443/https/stream/mixed` — receive (multipart H.264 + G.711µ); re-packetized as RTP into a local RTSP server (`spawnKasaStream`) for Scrypted to consume.
   - `:18443/https/speaker/audio/g711block` — talk (uplink chunked POST, multipart parts of 20 ms G.711µ blocks).
   - `:10443/data/LINKIE2.json` — control plane (spotlight, siren, status LED). Wire format: form-encoded `content=<base64(xor_ab(json))>`, requires `User-Agent: Kasa/...` and Basic auth.
-  - Auth uses the cloud account password, but with **different encodings per endpoint**: receive = `base64(plaintext)`, talk + LINKIE2 = `md5_hex(plaintext)`. `KasaClient` / `KasaTalkSession` / `KasaLinkieClient` each apply the right one — don't homogenize.
+  - Auth uses the cloud account password, but with **different encodings per endpoint**: receive = `base64(plaintext)`, talk + LINKIE2 = `md5_hex(plaintext)`. The two encodings live side by side in `src/camera/http.ts` (`kasaStreamAuth`, `kasaControlAuth`) — don't homogenize.
 - **IOT devices** (`src/iot/`) — plugs/switches/dimmers/bulbs over local TCP/9999. Wire format: 4-byte BE length prefix + XOR-AB(plaintext-json). No cloud auth. Same XOR-AB cipher (`src/shared/cipher.ts`) is used for UDP/9999 discovery.
 - **Discovery** (`src/shared/discovery.ts`) — single UDP/9999 sweep finds both families: a broadcast plus a paced unicast of every IP on the connected /24. Newer camera firmware drops the broadcast but answers the unicast; pacing is required to avoid kernel coalescing. Larger subnets (/23+) are skipped.
 
