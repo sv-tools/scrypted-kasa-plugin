@@ -1,5 +1,5 @@
 import net from 'net';
-import { xorDecrypt, xorEncryptInPlace } from '../shared/cipher';
+import { xorDecryptInPlace, xorEncryptInPlace } from '../shared/cipher';
 
 // Legacy Kasa "IOT" protocol used by plugs, switches, and bulbs (everything that isn't a
 // camera). Wire format on TCP/9999:
@@ -32,9 +32,8 @@ export async function kasaIotCall(options: KasaIotOptions, command: Record<strin
 
     return new Promise((resolve, reject) => {
         const socket = new net.Socket();
-        // Queue of received TCP chunks plus byte total, so we don't repeatedly Buffer.concat
-        // the accumulator on every 'data' event (O(n²) over multi-chunk responses; bulb
-        // light_state replies span 2-3 chunks).
+        // Received TCP chunks, joined once when the whole reply is in (bulb light_state replies
+        // span 2-3 chunks) rather than on every 'data' event.
         const chunks: Buffer[] = [];
         let queuedBytes = 0;
         let expected = -1;
@@ -55,57 +54,20 @@ export async function kasaIotCall(options: KasaIotOptions, command: Record<strin
 
         const timer = setTimeout(() => finish(new Error(`kasa iot call timeout after ${timeoutMs}ms`)), timeoutMs);
 
-        const peek4 = (): number => {
-            // We've verified queuedBytes >= 4 before calling. Read big-endian uint32 either
-            // straight from the head buffer (common case) or after walking the queue.
-            if (chunks[0].length >= 4) return chunks[0].readUInt32BE(0);
-            // Rare: 4-byte length straddles two chunks. Concat just the first two.
-            return Buffer.concat(chunks.slice(0, 2), 4).readUInt32BE(0);
-        };
-
-        const consume = (n: number): Buffer => {
-            // Pop and return exactly n bytes from the head of the queue.
-            queuedBytes -= n;
-            if (chunks[0].length === n) return chunks.shift()!;
-            if (chunks[0].length > n) {
-                const out = chunks[0].subarray(0, n);
-                chunks[0] = chunks[0].subarray(n);
-                return out;
-            }
-            const out = Buffer.allocUnsafe(n);
-            let written = 0;
-            while (written < n) {
-                const head = chunks[0];
-                const need = n - written;
-                if (head.length <= need) {
-                    head.copy(out, written);
-                    written += head.length;
-                    chunks.shift();
-                } else {
-                    head.copy(out, written, 0, need);
-                    chunks[0] = head.subarray(need);
-                    written = n;
-                }
-            }
-            return out;
-        };
-
         socket.on('data', (chunk: Buffer) => {
+            if (settled) return;
             chunks.push(chunk);
             queuedBytes += chunk.length;
-            if (expected < 0) {
-                if (queuedBytes < 4) return;
-                expected = peek4();
-                consume(4);
-            }
-            if (queuedBytes >= expected) {
-                const cipher = consume(expected);
-                const plain = xorDecrypt(cipher).toString('utf8');
-                try {
-                    finish(undefined, JSON.parse(plain));
-                } catch (e) {
-                    finish(e as Error);
-                }
+            if (queuedBytes < 4) return;
+            // The 4-byte length prefix almost always arrives whole in the first chunk.
+            if (expected < 0) expected = (chunks[0].length >= 4 ? chunks[0] : Buffer.concat(chunks)).readUInt32BE(0);
+            if (queuedBytes < 4 + expected) return;
+            // The joined buffer is ours alone, so decrypt it in place.
+            const cipher = Buffer.concat(chunks, queuedBytes).subarray(4, 4 + expected);
+            try {
+                finish(undefined, JSON.parse(xorDecryptInPlace(cipher).toString('utf8')));
+            } catch (e) {
+                finish(e as Error);
             }
         });
 

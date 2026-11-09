@@ -1,20 +1,7 @@
-import {
-    Brightness,
-    ColorHsv,
-    ColorSettingHsv,
-    ColorSettingTemperature,
-    OnOff,
-    Readme,
-    ScryptedDeviceBase,
-    Setting,
-    Settings,
-    SettingValue,
-} from '@scrypted/sdk';
+import { Brightness, ColorHsv, ColorSettingHsv, ColorSettingTemperature, OnOff } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
-import { formatKasaMac, renderKv } from '../shared/readme';
-import { KASA_IOT_PORT, getSysInfo, kasaIotCall } from './protocol';
-
-const STATE_POLL_INTERVAL_MS = 30000;
+import { IOT_NETWORK_SETTINGS, KasaIotBase } from './base';
+import { getSysInfo } from './protocol';
 
 // Smart bulbs (LB100/110/120/130, KL110/120/130/135/...). All bulb state — on/off,
 // brightness, hue, saturation, color temperature — is controlled by a single command:
@@ -26,20 +13,9 @@ const STATE_POLL_INTERVAL_MS = 30000;
 //   is_variable_color_temp 1 = supports color temperature
 // Color temperature range is determined per-model; we expose the values the bulb returns
 // in `getTemperatureMinK`/`getTemperatureMaxK` and fall back to a safe pair otherwise.
-export class KasaBulb
-    extends ScryptedDeviceBase
-    implements OnOff, Brightness, ColorSettingHsv, ColorSettingTemperature, Settings, Readme
-{
+export class KasaBulb extends KasaIotBase implements OnOff, Brightness, ColorSettingHsv, ColorSettingTemperature {
     storageSettings = new StorageSettings(this, {
-        ip: {
-            title: 'IP Address',
-            placeholder: '192.168.1.100',
-        },
-        port: {
-            title: 'Port',
-            type: 'number',
-            defaultValue: KASA_IOT_PORT,
-        },
+        ...IOT_NETWORK_SETTINGS,
         // Capability flags captured from sysinfo at adoption — internal only, drive which
         // interfaces the device advertises. Hidden because users don't typically need to
         // toggle them (auto-detected from the bulb's own metadata).
@@ -63,40 +39,9 @@ export class KasaBulb
         },
     });
 
-    private pollTimer?: NodeJS.Timeout;
-    private pollStartTimer?: NodeJS.Timeout;
-    // See KasaIotDevice for rationale: shared in-flight promise prevents overlapping
-    // refreshState calls from racing if a poll takes longer than the interval.
-    private refreshInFlight?: Promise<void>;
-
-    constructor(nativeId: string) {
-        super(nativeId);
-        process.nextTick(() => this.refreshState().catch(e => this.console.warn('refresh state failed', e)));
-        // Random first-fire offset to spread load when many bulbs are constructed together.
-        const jitter = Math.floor(Math.random() * STATE_POLL_INTERVAL_MS);
-        this.pollStartTimer = setTimeout(() => {
-            this.pollStartTimer = undefined;
-            this.pollTimer = setInterval(() => this.refreshState().catch(() => {}), STATE_POLL_INTERVAL_MS);
-        }, jitter);
-    }
-
-    getSettings(): Promise<Setting[]> {
-        return this.storageSettings.getSettings();
-    }
-
-    putSetting(key: string, value: SettingValue): Promise<void> {
-        return this.storageSettings.putSetting(key, value);
-    }
-
-    // Per-device Readme tab. Bulbs don't share KasaIotDevice's base implementation
-    // (different inheritance chain because of the color/brightness mixins), so the
-    // structure is duplicated here on purpose. Adds the static capability list (color /
-    // color-temp range) since those depend on per-model sysinfo flags. Live state is not
-    // duplicated here — the device page already shows it.
+    // Per-device Readme tab. Adds the static capability list (color / color-temp range), since
+    // those depend on per-model sysinfo flags.
     async getReadmeMarkdown(): Promise<string> {
-        const info = this.info || {};
-        const ip = this.storageSettings.values.ip || info.ip || '?';
-        const port = this.storageSettings.values.port || KASA_IOT_PORT;
         const { isColor, isVariableColorTemp, colorTemperatureMinK, colorTemperatureMaxK } =
             this.storageSettings.values;
 
@@ -106,28 +51,14 @@ export class KasaBulb
             capabilities.push(`Color temperature (${colorTemperatureMinK}–${colorTemperatureMaxK} K)`);
 
         return [
-            `# ${this.name || 'Kasa Bulb'}`,
-            '',
-            '## Device',
-            '',
-            '```',
-            renderKv([
-                ['Model', info.model || '?'],
-                ['Hardware', info.version || '?'],
-                ['Firmware', info.firmware || '?'],
-                ['MAC', formatKasaMac(info.mac)],
-                ['IP', ip],
-                ['Port', String(port)],
-            ]),
-            '```',
-            '',
+            ...this.readmeDeviceSection('Kasa Bulb'),
             '## Capabilities',
             '',
             ...capabilities.map(c => `- ${c}`),
             '',
             '## Protocol',
             '',
-            `Local TCP/${port} — Kasa's legacy "smarthome" wire format. All bulb state changes`,
+            `Local TCP/${this.readmePort} — Kasa's legacy "smarthome" wire format. All bulb state changes`,
             'are issued via `smartlife.iot.smartbulb.lightingservice.transition_light_state`.',
         ].join('\n');
     }
@@ -173,52 +104,32 @@ export class KasaBulb
         return this.storageSettings.values.colorTemperatureMaxK;
     }
 
-    async refreshState(): Promise<void> {
-        if (this.refreshInFlight) return this.refreshInFlight;
-        this.refreshInFlight = this.refreshStateInternal().finally(() => {
-            this.refreshInFlight = undefined;
-        });
-        return this.refreshInFlight;
-    }
-
-    private async refreshStateInternal(): Promise<void> {
-        if (!this.storageSettings.values.ip) return;
+    protected async refreshStateInternal(): Promise<void> {
         const sys = await getSysInfo(this.iotOptions());
         const ls = sys?.light_state;
         if (!ls) return;
         // light_state during off-state nests the actual values under `dft_on_state`.
         const active = ls.on_off ? ls : ls.dft_on_state || {};
-        this.on = ls.on_off === 1;
-        if (typeof active.brightness === 'number') this.brightness = active.brightness;
-        if (typeof active.color_temp === 'number') this.colorTemperature = active.color_temp;
+        this.update('on', ls.on_off === 1);
+        if (typeof active.brightness === 'number') this.update('brightness', active.brightness);
+        if (typeof active.color_temp === 'number') this.update('colorTemperature', active.color_temp);
         if (typeof active.hue === 'number' && typeof active.saturation === 'number') {
             const hsv: ColorHsv = {
                 h: active.hue,
                 s: active.saturation,
                 v: typeof active.brightness === 'number' ? active.brightness : 100,
             };
-            this.hsv = hsv;
+            const prev = this.hsv;
+            if (prev?.h !== hsv.h || prev?.s !== hsv.s || prev?.v !== hsv.v) this.hsv = hsv;
         }
     }
 
     private lightState(state: Record<string, any>): Promise<any> {
         // ignore_default tells the bulb to merge with current state instead of resetting.
-        return kasaIotCall(this.iotOptions(), {
+        return this.callIot({
             'smartlife.iot.smartbulb.lightingservice': {
                 transition_light_state: { ignore_default: 1, ...state },
             },
         });
-    }
-
-    private iotOptions() {
-        return {
-            host: this.storageSettings.values.ip,
-            port: this.storageSettings.values.port,
-        };
-    }
-
-    release(): void {
-        clearInterval(this.pollTimer);
-        clearTimeout(this.pollStartTimer);
     }
 }
