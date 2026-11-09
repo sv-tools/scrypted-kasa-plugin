@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `npm run build` | Webpack bundle into `out/main.nodejs.js` (+ `plugin.zip`) |
 | `npm run fmt` / `npm run fmt:check` | Prettier — `fmt:check` is what CI runs |
 | `npm run lint` / `npm run lint:fix` | ESLint |
-| `npm run scrypted-deploy <host>` | Build and deploy to a Scrypted server (`<host>` is the Scrypted IP/hostname) |
+| `npm run scrypted-deploy <host>` | Build and deploy to a Scrypted server (`<host>` is the Scrypted IP/hostname). The build comes from the `prescrypted-deploy` hook; the SDK's `scrypted-deploy` alone only uploads the existing `out/plugin.zip` |
 
 There is no test suite. CI runs `fmt:check`, `lint`, and `build` only. Don't add a "run the tests" step or suggest one when none exist.
 
