@@ -93,8 +93,8 @@ async function preScanSpsPps(kasa: KasaClient): Promise<{ sps: Buffer; pps: Buff
         const part = await kasa.readPart();
         if (part.contentType === KasaMimeVideo) findSpsPps(part.body, found);
     }
-    // Copies: findSpsPps returns views into the part, and holding one would keep the whole
-    // IDR (80+ KB) alive for as long as the stream runs.
+    // Copies: findSpsPps returns views into the part, so a caller that keeps them would
+    // otherwise pin the whole IDR (80+ KB).
     return { sps: Buffer.from(found.sps), pps: Buffer.from(found.pps) };
 }
 
@@ -306,14 +306,9 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
         });
         // The pump is already running and can end the stream first (the camera closed the
         // body, or the first part was malformed). close() in cleanupAll cancels a pending
-        // listen without emitting 'listening' or 'error', so nothing above would settle; and
-        // a teardown that ran before the server existed never closed it.
+        // listen without emitting 'listening' or 'error', so nothing above would settle.
         void exited.then(() => {
-            if (listening) return;
-            try {
-                tcpServer!.close();
-            } catch {}
-            reject(new Error('kasa stream ended before the RTSP server started'));
+            if (!listening) reject(new Error('kasa stream ended before the RTSP server started'));
         });
     });
     const url = `rtsp://127.0.0.1:${(tcpServer.address() as net.AddressInfo).port}/kasa`;
