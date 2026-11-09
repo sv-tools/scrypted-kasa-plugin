@@ -160,7 +160,10 @@ export class KasaLinkieClient {
 
     private async command(module: string, method: string, args: Record<string, any> = {}): Promise<void> {
         const errCode = (await this.invoke(module, method, args))?.err_code;
-        if (errCode !== 0) throw new KasaLinkieError(`${module} ${method} err_code=${errCode}`, errCode);
+        if (errCode === 0) return;
+        // The arguments say which call it was (e.g. which PTZ direction hit its end stop).
+        const sent = Object.keys(args).length ? ` ${JSON.stringify(args)}` : '';
+        throw new KasaLinkieError(`${module} ${method}${sent} err_code=${errCode}`, errCode);
     }
 
     private setState(module: string, method: string, on: boolean): Promise<void> {
