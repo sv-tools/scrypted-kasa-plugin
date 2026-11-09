@@ -22,6 +22,13 @@ export interface KasaSysInfo {
     mic_type?: string;
     sw_ver?: string;
     hw_ver?: string;
+    // Read by adoption to pick the device class and its interfaces.
+    dev_name?: string;
+    feature?: string;
+    brightness?: number;
+    is_color?: number;
+    is_variable_color_temp?: number;
+    children?: unknown[];
     [key: string]: unknown;
 }
 
@@ -32,6 +39,8 @@ export interface KasaDiscoveredDevice {
     model: string;
     mac: string;
     type: string;
+    // sysinfo.sw_ver, when the device reported one.
+    firmware?: string;
     sysinfo: KasaSysInfo;
 }
 
@@ -179,12 +188,12 @@ export async function discoverKasa(durationMs: number = 2500, console?: Console)
                     mic_type: sys.mic_type,
                     sw_ver: sys.sw_ver,
                     hw_ver: sys.hw_ver,
-                    dev_name: (sys as any).dev_name,
-                    feature: (sys as any).feature,
-                    brightness: (sys as any).brightness,
-                    is_color: (sys as any).is_color,
-                    is_variable_color_temp: (sys as any).is_variable_color_temp,
-                    children: (sys as any).children,
+                    dev_name: sys.dev_name,
+                    feature: sys.feature,
+                    brightness: sys.brightness,
+                    is_color: sys.is_color,
+                    is_variable_color_temp: sys.is_variable_color_temp,
+                    children: sys.children,
                 };
                 found.set(deviceId, {
                     address: rinfo.address,
@@ -193,6 +202,7 @@ export async function discoverKasa(durationMs: number = 2500, console?: Console)
                     model: sys.model || '',
                     mac: (sys.mic_mac || sys.mac || '').toString(),
                     type: (sys.type || sys.mic_type || '').toString(),
+                    firmware: typeof sys.sw_ver === 'string' ? sys.sw_ver : undefined,
                     sysinfo: slim,
                 });
             } catch (e) {
