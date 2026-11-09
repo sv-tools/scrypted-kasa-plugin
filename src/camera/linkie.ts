@@ -45,11 +45,35 @@ export interface KasaPtzPreset {
     name: string;
 }
 
+// LINKIE2 error codes, the same on KC410S / KC420WS / KD110 firmware.
+// -10008 "Unsupported API call." covers unknown modules as well as unknown methods.
+export const KASA_LINKIE_CAMERA_OFF = -40919;
+
+export class KasaLinkieError extends Error {
+    constructor(
+        message: string,
+        public errCode?: number,
+    ) {
+        super(message);
+    }
+}
+
 export class KasaLinkieClient {
+    // One kept-alive connection per camera. Motion polling calls once a second; reusing the TLS
+    // session takes a call from ~500 ms to ~30 ms. maxSockets 1 also queues concurrent callers
+    // (a poll racing a settings probe): parallel calls to one camera occasionally drop responses.
+    private agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
+
     constructor(
         public options: KasaLinkieOptions,
         public logger?: KasaLinkieClientLogger,
     ) {}
+
+    // Closes the kept-alive connection. The socket belongs to the host Node process, so a
+    // replaced or released client would otherwise hold it open until the camera drops it.
+    destroy(): void {
+        this.agent.destroy();
+    }
 
     async call(command: Record<string, any>): Promise<any> {
         const body = {
@@ -67,47 +91,59 @@ export class KasaLinkieClient {
         const auth =
             'Basic ' + Buffer.from(`${this.options.username}:${md5Hex(this.options.password)}`).toString('base64');
 
-        const respBuffer = await new Promise<Buffer>((resolve, reject) => {
-            const req = https.request(
-                {
-                    host: this.options.ip,
-                    port: this.options.port || KASA_LINKIE_PORT,
-                    method: 'POST',
-                    path: KASA_LINKIE_PATH,
-                    rejectUnauthorized: false,
-                    // Mirror the Kasa iOS app's headers — the camera gates /data/LINKIE2.json on the
-                    // User-Agent (silently drops requests that don't look like the Kasa app).
-                    headers: {
-                        Authorization: auth,
-                        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
-                        'Content-Length': formBody.length,
-                        'User-Agent': 'Kasa/1752 CFNetwork/3860.500.112 Darwin/25.4.0',
-                        Accept: '*/*',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        // We don't decompress responses (camera never sends compressed today, but
-                        // advertising 'gzip' would let a future firmware break our base64+XOR decode).
-                        'Accept-Encoding': 'identity',
-                        Connection: 'keep-alive',
+        // `stale` marks a failure on a reused kept-alive socket that the camera had closed while
+        // idle; Node only learns that on the next write, so that one request is retried once.
+        const send = () =>
+            new Promise<Buffer>((resolve, reject) => {
+                const req = https.request(
+                    {
+                        host: this.options.ip,
+                        port: this.options.port || KASA_LINKIE_PORT,
+                        method: 'POST',
+                        path: KASA_LINKIE_PATH,
+                        agent: this.agent,
+                        rejectUnauthorized: false,
+                        // Mirror the Kasa iOS app's headers — the camera gates /data/LINKIE2.json on the
+                        // User-Agent (silently drops requests that don't look like the Kasa app).
+                        headers: {
+                            Authorization: auth,
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+                            'Content-Length': formBody.length,
+                            'User-Agent': 'Kasa/1752 CFNetwork/3860.500.112 Darwin/25.4.0',
+                            Accept: '*/*',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            // We don't decompress responses (camera never sends compressed today, but
+                            // advertising 'gzip' would let a future firmware break our base64+XOR decode).
+                            'Accept-Encoding': 'identity',
+                            Connection: 'keep-alive',
+                        },
                     },
-                },
-                res => {
-                    if (res.statusCode && res.statusCode >= 400) {
-                        res.resume();
-                        reject(new Error(`kasa linkie HTTP ${res.statusCode}`));
-                        return;
-                    }
-                    const chunks: Buffer[] = [];
-                    res.on('data', c => chunks.push(c));
-                    res.on('end', () => resolve(Buffer.concat(chunks)));
-                    res.on('error', reject);
-                },
-            );
-            req.setTimeout(KASA_LINKIE_TIMEOUT_MS, () => {
-                req.destroy(new Error(`kasa linkie request timeout after ${KASA_LINKIE_TIMEOUT_MS}ms`));
+                    res => {
+                        if (res.statusCode && res.statusCode >= 400) {
+                            res.resume();
+                            reject(new Error(`kasa linkie HTTP ${res.statusCode}`));
+                            return;
+                        }
+                        const chunks: Buffer[] = [];
+                        res.on('data', c => chunks.push(c));
+                        res.on('end', () => resolve(Buffer.concat(chunks)));
+                        res.on('error', reject);
+                    },
+                );
+                req.setTimeout(KASA_LINKIE_TIMEOUT_MS, () => {
+                    req.destroy(new Error(`kasa linkie request timeout after ${KASA_LINKIE_TIMEOUT_MS}ms`));
+                });
+                req.on('error', e => {
+                    const code = (e as NodeJS.ErrnoException).code;
+                    if (req.reusedSocket && (code === 'ECONNRESET' || code === 'EPIPE')) (e as any).stale = true;
+                    reject(e);
+                });
+                req.write(formBody);
+                req.end();
             });
-            req.on('error', reject);
-            req.write(formBody);
-            req.end();
+        const respBuffer = await send().catch(e => {
+            if (!(e as any).stale) throw e;
+            return send();
         });
 
         const respB64 = respBuffer.toString('utf8').trim();
@@ -285,6 +321,27 @@ export class KasaLinkieClient {
         const errCode = r?.['smartlife.cam.ipcamera.ptz']?.set_move?.err_code;
         // -41203 covers both a bad value and an axis already at its end stop.
         if (errCode !== 0) throw new Error(`ptz set_move ${direction} err_code=${errCode}`);
+    }
+
+    // The camera's own motion detection, under smartlife.cam.ipcamera.vod. The firmware wants
+    // `timestamp` (Unix seconds, after 2019-05-01) directly in the method object, and reports a
+    // missing one as "The parameter [start_time] is required." (-40700), which is misleading.
+    // is_moving is true while an alarm fired within the last ~2 s: motion, person, baby cry, or a
+    // doorbell ring (sound alarms excluded). There is no push or long-poll; callers poll.
+    // The timestamp only feeds the SD-recording flags (is_video_ready / is_event_finish).
+    async getMotionDetected(): Promise<boolean> {
+        const r = await this.call({
+            'smartlife.cam.ipcamera.vod': {
+                get_detect_event_state: { timestamp: Math.floor(Date.now() / 1000) },
+            },
+        });
+        const v = r?.['smartlife.cam.ipcamera.vod']?.get_detect_event_state;
+        if (v?.err_code !== 0)
+            throw new KasaLinkieError(
+                `get_detect_event_state err_code=${v?.err_code} ${v?.err_msg || ''}`,
+                v?.err_code,
+            );
+        return v.is_moving === true;
     }
 
     async ptzRunToPreset(index: number): Promise<void> {

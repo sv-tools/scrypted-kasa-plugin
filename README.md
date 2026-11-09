@@ -45,6 +45,16 @@ In Scrypted:
 - Exposes **pan/tilt** (when present, e.g. KC410S) as the camera's own `PanTiltZoom`
   interface: step moves in the Scrypted and NVR camera views, plus the viewpoints saved in
   the Kasa app as presets. HomeKit has no pan/tilt support, so this is not visible there.
+- **Motion events from camera** (per-camera setting, off by default): uses the camera's own
+  motion detection as the camera's `MotionSensor`, read over LINKIE2 once a second
+  (`smartlife.cam.ipcamera.vod.get_detect_event_state`). No video is decoded on the server.
+  Sensitivity and zones come from the Kasa app, and person detection or a doorbell ring also
+  count as motion. Motion stays on for 10 s after the camera last reports it. With Video
+  Analysis on the same camera, its **Built-In Motion Sensor** option picks which detector wins.
+- **Snapshots from camera** (per-camera setting, off by default): answers snapshot requests
+  from the camera's own JPEG endpoint (`/https/stream/snapshot.jpg` on port 19443) instead of
+  decoding a frame from the video stream. It takes about half a second and works while the
+  stream is in use, but the image is a fixed 640x360.
 - Adds a **Reboot camera** button to the camera's Settings tab
   (`smartlife.cam.ipcamera.system.set_reboot` over LINKIE2). Useful when the video stream
   stops — connection refused on port 19443 while the control port still answers — which
@@ -181,9 +191,10 @@ setup below.
   header on the very first request — the camera silently drops requests that don't look
   enough like the official app.
 - The camera presents a self-signed TLS certificate; certificate verification is disabled.
-- **One stream connection per camera.** The camera serves a single client on the stream
-  port (19443); a second connection opens at the TCP level but stalls in the TLS handshake
-  until it times out. Scrypted's rebroadcast (prebuffer) plugin holds that one connection
+- **One live stream connection per camera.** The camera serves a single client on the live
+  stream (`/https/stream/mixed` on port 19443); a second connection opens at the TCP level but
+  stalls in the TLS handshake until it times out. The snapshot endpoint on the same port isn't
+  affected. Scrypted's rebroadcast (prebuffer) plugin holds that one connection
   and fans it out to HomeKit, the NVR and other clients, so keep it enabled. Another local
   client (a second NVR, a manual `curl`) can't connect to the stream while Scrypted holds it.
 - Auto-discovery sweeps the local /24 only. Larger subnets (e.g. /23) are skipped to
