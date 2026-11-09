@@ -297,10 +297,23 @@ export async function spawnKasaStream(opts: KasaStreamOptions): Promise<KasaStre
     });
 
     await new Promise<void>((resolve, reject) => {
+        let listening = false;
         tcpServer!.once('error', reject);
         tcpServer!.listen(0, '127.0.0.1', () => {
+            listening = true;
             tcpServer!.removeListener('error', reject);
             resolve();
+        });
+        // The pump is already running and can end the stream first (the camera closed the
+        // body, or the first part was malformed). close() in cleanupAll cancels a pending
+        // listen without emitting 'listening' or 'error', so nothing above would settle; and
+        // a teardown that ran before the server existed never closed it.
+        void exited.then(() => {
+            if (listening) return;
+            try {
+                tcpServer!.close();
+            } catch {}
+            reject(new Error('kasa stream ended before the RTSP server started'));
         });
     });
     const url = `rtsp://127.0.0.1:${(tcpServer.address() as net.AddressInfo).port}/kasa`;
