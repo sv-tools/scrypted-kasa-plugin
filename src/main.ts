@@ -80,6 +80,31 @@ const MOTION_POLL_MAX_BACKOFF_MS = 30_000;
 // While the camera is off (Privacy Mode) it detects nothing; check back at this pace.
 const MOTION_POLL_PRIVACY_MS = 5_000;
 
+// Snapshots from the camera (the "Snapshots from camera" setting). The camera occasionally
+// fails or stalls on a snapshot, so the last good one is kept and served instead: when the
+// request fails, or when it hasn't answered after this long (a normal one takes ~0.5 s, and
+// HomeKit gives up on a snapshot after a few seconds).
+const SNAPSHOT_FALLBACK_AFTER_MS = 2_500;
+// The kept snapshot is only served this long; an older picture would pass for the current view.
+const SNAPSHOT_FALLBACK_MAX_AGE_MS = 10 * 60_000;
+// Before the kept snapshot is served, how long to wait for the camera to say whether it is on.
+const SNAPSHOT_OFF_CHECK_MS = 1_000;
+
+// Resolves with the promise, or with `fallback` if it hasn't settled after `ms`.
+async function withTimeout<T, F>(promise: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<F>(resolve => {
+                timer = setTimeout(() => resolve(fallback), ms);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // The error for a camera turned off in Privacy Mode; getVideoStream holds on it.
 class CameraOffError extends Error {
     constructor() {
@@ -406,6 +431,18 @@ class KasaCamera
     private motionHoldTimer?: NodeJS.Timeout;
     private motionPollBackoffMs = MOTION_POLL_MS;
     private motionPollFailing = false;
+    // The last good snapshot, served when the camera fails the next one. Memory only.
+    private lastSnapshot?: { jpeg: Buffer; at: number };
+    private snapshotFailing = false;
+    // Bumped by dropSnapshot(), so a request that was in flight across it neither puts a
+    // picture back nor is shared with callers that came after.
+    private snapshotGeneration = 0;
+    // Whether the latest drop was for a camera that is off, so a request waiting across it
+    // fails with that reason.
+    private snapshotDroppedOff = false;
+    private snapshotFlight?: { generation: number; promise: Promise<Buffer> };
+    // The connection settings the kept snapshot was taken with.
+    private snapshotEndpoint?: string;
 
     constructor(nativeId: string) {
         super(nativeId);
@@ -529,6 +566,7 @@ class KasaCamera
             this.children.get('privacy') ??
             (deviceManager.getNativeIds().includes(this.childNativeId('privacy')) ? this.child('privacy') : undefined);
         if (privacy && privacy.on !== off) privacy.on = off;
+        if (off) this.dropSnapshot(true);
         this.setPrivacyPoll(off);
     }
 
@@ -660,6 +698,7 @@ class KasaCamera
             if (e instanceof KasaLinkieError && e.errCode === KASA_LINKIE_CAMERA_OFF) {
                 // Turned off outside the plugin; Privacy Mode catches up through its own poll.
                 this.clearMotion();
+                this.dropSnapshot(true);
                 delay = MOTION_POLL_PRIVACY_MS;
             } else {
                 // Logged once per outage: at one poll a second, every failure would flood the console.
@@ -691,18 +730,128 @@ class KasaCamera
         }, MOTION_HOLD_MS);
     }
 
-    // Camera interface, published only while "Snapshots from camera" is on.
-    async takePicture(_options?: RequestPictureOptions): Promise<MediaObject> {
-        // The camera answers 503 when it's off; skip the round trip.
-        if (this.privacyMode) throw new CameraOffError();
+    // Discards the kept snapshot once it is no longer this camera's current view: the camera
+    // was turned off (a camera that is off must not show a picture from before), or it now
+    // points at another address or account.
+    private dropSnapshot(cameraOff = false): void {
+        this.snapshotGeneration++;
+        this.lastSnapshot = undefined;
+        this.snapshotDroppedOff = cameraOff;
+    }
+
+    // Asks the camera whether it is off, and records it if so. Shared, and it acts on the answer
+    // itself, so one that arrives after a caller stopped waiting still drops the kept snapshot.
+    private readonly checkCameraOff = singleFlight(async () => {
+        const privacyChanges = this.privacyChanges;
+        const linkie = this.linkie();
+        // Quiet: with the camera off the network this fails on every fallback, and the snapshot
+        // failure is already logged once.
+        if ((await linkie.getCameraEnabled(true)) !== 'off') return false;
+        // The camera was re-pointed or released meanwhile; the answer is about the old one.
+        if (this.released || this.linkie() !== linkie) return false;
+        // Privacy Mode was changed while the check was in flight; its 'off' may be stale.
+        if (privacyChanges !== this.privacyChanges) return this.lastPrivacySet;
+        this.updatePrivacyState(true);
+        return true;
+    });
+
+    // Compared on use, like linkie(), rather than hooked into each place that changes the
+    // settings: the address also changes through Refresh devices, which writes it directly.
+    private dropSnapshotIfReconfigured(): void {
         const { ip, port, username, password } = this.storageSettings.values;
-        const jpeg = await fetchKasaSnapshot({ ip, port, username, password }).catch((e: Error) => {
-            // Turned off outside the plugin (Kasa app) since Privacy Mode last synced.
-            if (e instanceof KasaSnapshotError && e.statusCode === 503) return undefined;
-            throw e;
-        });
-        if (!jpeg) throw new CameraOffError();
-        return mediaManager.createMediaObject(jpeg, 'image/jpeg');
+        const endpoint = JSON.stringify([ip, port, username, password]);
+        if (endpoint === this.snapshotEndpoint) return;
+        this.dropSnapshot();
+        this.snapshotEndpoint = endpoint;
+    }
+
+    // One request at a time: concurrent callers (HomeKit asks for several sizes at once) share
+    // it, and a request that outlived its caller's wait still refreshes the kept snapshot.
+    // `share` is false for an event request, which must not get a picture that a request
+    // started before the event is still delivering.
+    private fetchSnapshot(share: boolean): Promise<Buffer> {
+        const generation = this.snapshotGeneration;
+        if (share && this.snapshotFlight?.generation === generation) return this.snapshotFlight.promise;
+        const { ip, port, username, password } = this.storageSettings.values;
+        const promise = fetchKasaSnapshot({ ip, port, username, password })
+            .then(
+                jpeg => {
+                    if (generation === this.snapshotGeneration) this.lastSnapshot = { jpeg, at: Date.now() };
+                    return jpeg;
+                },
+                (e: Error) => {
+                    // Turned off outside the plugin (Kasa app) since Privacy Mode last synced.
+                    // Handled here so it counts even when no caller is still waiting.
+                    if (!(e instanceof KasaSnapshotError) || e.statusCode !== 503) throw e;
+                    if (generation === this.snapshotGeneration) this.dropSnapshot(true);
+                    throw new CameraOffError();
+                },
+            )
+            .finally(() => {
+                if (this.snapshotFlight?.promise === promise) this.snapshotFlight = undefined;
+            });
+        this.snapshotFlight = { generation, promise };
+        return promise;
+    }
+
+    // Camera interface, published only while "Snapshots from camera" is on.
+    async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        // The camera answers 503 when it's off; skip the round trip.
+        if (this.privacyMode) {
+            this.dropSnapshot(true);
+            throw new CameraOffError();
+        }
+        this.dropSnapshotIfReconfigured();
+        const generation = this.snapshotGeneration;
+        const last = this.lastSnapshot;
+        // An event request (a motion notification or thumbnail) must show what just happened, so
+        // it never gets the kept snapshot.
+        const event = options?.reason === 'event';
+        const kept = !event && last && Date.now() - last.at < SNAPSHOT_FALLBACK_MAX_AGE_MS ? last : undefined;
+        const fresh = this.fetchSnapshot(!event);
+
+        let jpeg: Buffer | undefined;
+        let reason = `no answer after ${SNAPSHOT_FALLBACK_AFTER_MS / 1000} s`;
+        if (!kept) {
+            jpeg = await fresh;
+        } else {
+            try {
+                jpeg = await withTimeout(fresh, SNAPSHOT_FALLBACK_AFTER_MS, undefined);
+            } catch (e) {
+                if (e instanceof CameraOffError) throw e;
+                reason = (e as Error).message;
+            }
+        }
+        if (jpeg) {
+            if (this.snapshotFailing) {
+                this.snapshotFailing = false;
+                this.console.log('camera snapshots recovered');
+            }
+            return mediaManager.createMediaObject(jpeg, 'image/jpeg');
+        }
+
+        // The kept snapshot may have been dropped during a wait: the camera was turned off,
+        // re-pointed or released.
+        const stillKept = () => {
+            if (this.privacyMode) throw new CameraOffError();
+            this.dropSnapshotIfReconfigured();
+            if (generation === this.snapshotGeneration) return;
+            throw this.snapshotDroppedOff ? new CameraOffError() : new Error(`Kasa camera snapshot failed: ${reason}`);
+        };
+        stillKept();
+        // Ask the control plane too: the camera may have been turned off in the Kasa app, which
+        // the plugin only learns from a stream attempt or a 503, and neither may have happened.
+        // Bounded, so an unreachable camera doesn't add the full LINKIE timeout; no answer
+        // leaves the state unknown and the kept snapshot is served.
+        if (await withTimeout(this.checkCameraOff(), SNAPSHOT_OFF_CHECK_MS, false)) throw new CameraOffError();
+        stillKept();
+        // Logged once per outage: HomeKit refreshes an open camera tile every few seconds.
+        if (!this.snapshotFailing) {
+            this.snapshotFailing = true;
+            this.console.warn(`camera snapshot failed (${reason}); serving the last good one until it recovers`);
+        }
+        // The request may have finished during the check above, leaving a newer one than `kept`.
+        return mediaManager.createMediaObject((this.lastSnapshot ?? kept!).jpeg, 'image/jpeg');
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
@@ -1356,6 +1505,7 @@ class KasaCamera
         clearTimeout(this.motionHoldTimer);
         this.cachedLinkie?.client.destroy();
         this.cachedLinkie = undefined;
+        this.dropSnapshot();
     }
 
     // Closes every live stream and the intercom. Each kill triggers cleanupAll inside

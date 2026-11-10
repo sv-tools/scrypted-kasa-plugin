@@ -54,7 +54,9 @@ In Scrypted:
 - **Snapshots from camera** (per-camera setting, off by default): answers snapshot requests
   from the camera's own JPEG endpoint (`/https/stream/snapshot.jpg` on port 19443) instead of
   decoding a frame from the video stream. It takes about half a second and works while the
-  stream is in use, but the image is a fixed 640x360.
+  stream is in use, but the image is a fixed 640x360. If the camera fails a snapshot or takes
+  longer than about 3 s, the last good one is returned instead (for up to 10 minutes, and never
+  while the camera is turned off or for an event snapshot such as a motion notification).
 - Adds a **Reboot camera** button to the camera's Settings tab
   (`smartlife.cam.ipcamera.system.set_reboot` over LINKIE2). Useful when the video stream
   stops — connection refused on port 19443 while the control port still answers — which

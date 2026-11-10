@@ -148,12 +148,12 @@ export class KasaLinkieClient {
 
     // Reads an on/off value. Doubles as the feature probe: undefined means the camera doesn't
     // have the feature (the module is missing from the response) or didn't answer.
-    private async getState(module: string, method: string): Promise<'on' | 'off' | undefined> {
+    private async getState(module: string, method: string, quiet = false): Promise<'on' | 'off' | undefined> {
         try {
             const v = (await this.invoke(module, method))?.value;
             return v === 'on' || v === 'off' ? v : undefined;
         } catch (e) {
-            this.logger?.warn?.(`kasa linkie ${module} ${method} failed:`, (e as Error).message);
+            if (!quiet) this.logger?.warn?.(`kasa linkie ${module} ${method} failed:`, (e as Error).message);
             return undefined;
         }
     }
@@ -203,8 +203,9 @@ export class KasaLinkieClient {
     // The camera's own on/off ("camera off" in the Kasa app), under switch. Off stops video for
     // every client, not just HomeKit: the stream port stays open but answers HTTP 503 until
     // it's turned back on, and the next stream attempt after that succeeds.
-    getCameraEnabled(): Promise<'on' | 'off' | undefined> {
-        return this.getState('switch', 'get_is_enable');
+    // `quiet` leaves a failed call unlogged, for a caller that already reported the outage.
+    getCameraEnabled(quiet = false): Promise<'on' | 'off' | undefined> {
+        return this.getState('switch', 'get_is_enable', quiet);
     }
 
     setCameraEnabled(on: boolean): Promise<void> {
