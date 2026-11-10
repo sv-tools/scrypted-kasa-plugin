@@ -443,15 +443,15 @@ class KasaCamera
     private snapshotFallbackStreak = 0;
     private snapshotFallbacksUnreported = 0;
     private snapshotFallbackReportedAt = 0;
-    // The request the latest fallback was counted for; callers that shared it count once.
-    private snapshotFallbackCounted?: Promise<Buffer>;
+    // The requests a fallback was counted for; callers that shared one count once.
+    private snapshotFallbackCounted = new WeakSet<Promise<Buffer>>();
     // Bumped by dropSnapshot(), so a request that was in flight across it neither puts a
     // picture back nor is shared with callers that came after.
     private snapshotGeneration = 0;
     // Whether the latest drop was for a camera that is off, so a request waiting across it
     // fails with that reason.
     private snapshotDroppedOff = false;
-    private snapshotFlight?: { generation: number; promise: Promise<Buffer> };
+    private snapshotFlight?: { generation: number; promise: Promise<Buffer>; startedAt: number };
     // The connection settings the kept snapshot was taken with.
     private snapshotEndpoint?: string;
 
@@ -801,7 +801,7 @@ class KasaCamera
             .finally(() => {
                 if (this.snapshotFlight?.promise === promise) this.snapshotFlight = undefined;
             });
-        this.snapshotFlight = { generation, promise };
+        this.snapshotFlight = { generation, promise, startedAt: Date.now() };
         return promise;
     }
 
@@ -809,8 +809,8 @@ class KasaCamera
     // by one: an outage (several in a row) is logged once when it starts, and the occasional
     // slow answer is summarized at most once per SNAPSHOT_FALLBACK_REPORT_MS.
     private logSnapshotFallback(request: Promise<Buffer>, reason: string): void {
-        if (request === this.snapshotFallbackCounted) return;
-        this.snapshotFallbackCounted = request;
+        if (this.snapshotFallbackCounted.has(request)) return;
+        this.snapshotFallbackCounted.add(request);
         this.snapshotFallbackStreak++;
         this.snapshotFallbacksUnreported++;
         const now = Date.now();
@@ -846,6 +846,8 @@ class KasaCamera
         const event = options?.reason === 'event';
         const kept = !event && last && Date.now() - last.at < SNAPSHOT_FALLBACK_MAX_AGE_MS ? last : undefined;
         const fresh = this.fetchSnapshot(!event);
+        // When the request started, which is earlier than now for a caller that joined one.
+        const started = this.snapshotFlight?.promise === fresh ? this.snapshotFlight.startedAt : Date.now();
 
         let jpeg: Buffer | undefined;
         let reason = `no answer after ${SNAPSHOT_FALLBACK_AFTER_MS / 1000} s`;
@@ -860,9 +862,15 @@ class KasaCamera
             }
         }
         if (jpeg) {
-            if (this.snapshotFallbackStreak >= SNAPSHOT_OUTAGE_STREAK) this.console.log('camera snapshots recovered');
-            this.snapshotFallbackStreak = 0;
-            this.snapshotFallbackCounted = undefined;
+            // Only a timely answer ends a streak: an event request waits as long as it takes, and
+            // a late one would otherwise read as a recovery from a camera that is still slow.
+            if (Date.now() - started < SNAPSHOT_FALLBACK_AFTER_MS) {
+                if (this.snapshotFallbackStreak >= SNAPSHOT_OUTAGE_STREAK) {
+                    this.console.log('camera snapshots recovered');
+                    this.snapshotFallbacksUnreported = 0;
+                }
+                this.snapshotFallbackStreak = 0;
+            }
             return mediaManager.createMediaObject(jpeg, 'image/jpeg');
         }
 
