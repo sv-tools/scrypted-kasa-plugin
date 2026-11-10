@@ -89,6 +89,10 @@ const SNAPSHOT_FALLBACK_AFTER_MS = 2_500;
 const SNAPSHOT_FALLBACK_MAX_AGE_MS = 10 * 60_000;
 // Before the kept snapshot is served, how long to wait for the camera to say whether it is on.
 const SNAPSHOT_OFF_CHECK_MS = 1_000;
+// This many fallbacks in a row is an outage, logged as a warning, and its end as a recovery.
+const SNAPSHOT_OUTAGE_STREAK = 3;
+// Fallbacks that are not part of an outage are summarized in one line at most this often.
+const SNAPSHOT_FALLBACK_REPORT_MS = 10 * 60_000;
 
 // Resolves with the promise, or with `fallback` if it hasn't settled after `ms`.
 async function withTimeout<T, F>(promise: Promise<T>, ms: number, fallback: F): Promise<T | F> {
@@ -433,14 +437,21 @@ class KasaCamera
     private motionPollFailing = false;
     // The last good snapshot, served when the camera fails the next one. Memory only.
     private lastSnapshot?: { jpeg: Buffer; at: number };
-    private snapshotFailing = false;
+    // Fallback logging. A camera on a weak link answers some snapshots late and the next one
+    // in time, so one line per fallback and per recovery would fill the console: fallbacks in
+    // a row are counted to tell an outage from a slow answer, and the rest are summarized.
+    private snapshotFallbackStreak = 0;
+    private snapshotFallbacksUnreported = 0;
+    private snapshotFallbackReportedAt = 0;
+    // The requests a fallback was counted for; callers that shared one count once.
+    private snapshotFallbackCounted = new WeakSet<Promise<Buffer>>();
     // Bumped by dropSnapshot(), so a request that was in flight across it neither puts a
     // picture back nor is shared with callers that came after.
     private snapshotGeneration = 0;
     // Whether the latest drop was for a camera that is off, so a request waiting across it
     // fails with that reason.
     private snapshotDroppedOff = false;
-    private snapshotFlight?: { generation: number; promise: Promise<Buffer> };
+    private snapshotFlight?: { generation: number; promise: Promise<Buffer>; startedAt: number };
     // The connection settings the kept snapshot was taken with.
     private snapshotEndpoint?: string;
 
@@ -790,8 +801,34 @@ class KasaCamera
             .finally(() => {
                 if (this.snapshotFlight?.promise === promise) this.snapshotFlight = undefined;
             });
-        this.snapshotFlight = { generation, promise };
+        this.snapshotFlight = { generation, promise, startedAt: Date.now() };
         return promise;
+    }
+
+    // HomeKit refreshes an open camera tile every few seconds, so fallbacks are not logged one
+    // by one: an outage (several in a row) is logged once when it starts, and the occasional
+    // slow answer is summarized at most once per SNAPSHOT_FALLBACK_REPORT_MS.
+    private logSnapshotFallback(request: Promise<Buffer>, reason: string): void {
+        if (this.snapshotFallbackCounted.has(request)) return;
+        this.snapshotFallbackCounted.add(request);
+        this.snapshotFallbackStreak++;
+        this.snapshotFallbacksUnreported++;
+        const now = Date.now();
+        if (this.snapshotFallbackStreak === SNAPSHOT_OUTAGE_STREAK) {
+            this.console.warn(
+                `camera snapshots keep failing (${reason}); serving the last good one until they recover`,
+            );
+        } else if (now - this.snapshotFallbackReportedAt >= SNAPSHOT_FALLBACK_REPORT_MS) {
+            const count = this.snapshotFallbacksUnreported;
+            this.console.log(
+                `camera snapshot was slow or failed (${reason}); served the last good one` +
+                    (count > 1 ? ` (${count} times since the last report)` : ''),
+            );
+        } else {
+            return;
+        }
+        this.snapshotFallbackReportedAt = now;
+        this.snapshotFallbacksUnreported = 0;
     }
 
     // Camera interface, published only while "Snapshots from camera" is on.
@@ -809,6 +846,8 @@ class KasaCamera
         const event = options?.reason === 'event';
         const kept = !event && last && Date.now() - last.at < SNAPSHOT_FALLBACK_MAX_AGE_MS ? last : undefined;
         const fresh = this.fetchSnapshot(!event);
+        // When the request started, which is earlier than now for a caller that joined one.
+        const started = this.snapshotFlight?.promise === fresh ? this.snapshotFlight.startedAt : Date.now();
 
         let jpeg: Buffer | undefined;
         let reason = `no answer after ${SNAPSHOT_FALLBACK_AFTER_MS / 1000} s`;
@@ -823,9 +862,14 @@ class KasaCamera
             }
         }
         if (jpeg) {
-            if (this.snapshotFailing) {
-                this.snapshotFailing = false;
-                this.console.log('camera snapshots recovered');
+            // Only a timely answer ends a streak: an event request waits as long as it takes, and
+            // a late one would otherwise read as a recovery from a camera that is still slow.
+            if (Date.now() - started < SNAPSHOT_FALLBACK_AFTER_MS) {
+                if (this.snapshotFallbackStreak >= SNAPSHOT_OUTAGE_STREAK) {
+                    this.console.log('camera snapshots recovered');
+                    this.snapshotFallbacksUnreported = 0;
+                }
+                this.snapshotFallbackStreak = 0;
             }
             return mediaManager.createMediaObject(jpeg, 'image/jpeg');
         }
@@ -845,11 +889,7 @@ class KasaCamera
         // leaves the state unknown and the kept snapshot is served.
         if (await withTimeout(this.checkCameraOff(), SNAPSHOT_OFF_CHECK_MS, false)) throw new CameraOffError();
         stillKept();
-        // Logged once per outage: HomeKit refreshes an open camera tile every few seconds.
-        if (!this.snapshotFailing) {
-            this.snapshotFailing = true;
-            this.console.warn(`camera snapshot failed (${reason}); serving the last good one until it recovers`);
-        }
+        this.logSnapshotFallback(fresh, reason);
         // The request may have finished during the check above, leaving a newer one than `kept`.
         return mediaManager.createMediaObject((this.lastSnapshot ?? kept!).jpeg, 'image/jpeg');
     }
