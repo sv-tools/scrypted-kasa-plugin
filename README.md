@@ -80,10 +80,8 @@ base that holds the relay protocol:
 
 Multi-outlet plug strips (HS300, KP303) aren't modeled yet — discovery skips them.
 
-Stream protocol described in [go2rtc's `pkg/kasa`](https://github.com/AlexxIT/go2rtc/tree/master/pkg/kasa);
-camera control protocols (LINKIE2, talk endpoint, status LED) modeled after the official
-Kasa iOS app's network traffic. The plug/bulb/switch protocol is the well-documented
-legacy "smarthome" TCP/9999 wire format.
+[docs/PROTOCOL.md](docs/PROTOCOL.md) documents every endpoint the plugin uses, in enough
+detail to write a driver in another language.
 
 Tested camera models: KD110, KC200, KC401, KC420WS, EC71.
 
@@ -104,15 +102,15 @@ Tested camera models: KD110, KC200, KC401, KC420WS, EC71.
      After the first camera is configured these are pre-populated from any other Kasa
      camera in Scrypted.
 
-Adopted devices get their IP, port, name, model, MAC, serial number, hardware version, and
-firmware version populated automatically (HomeKit shows the hardware version as Hardware
+Adopted devices get their IP, port, name, model, MAC, serial number, and hardware
+version populated automatically (HomeKit shows the hardware version as Hardware
 Revision). The manufacturer is reported as `TP-Link Kasa`.
 
 Discovery sends a single UDP/9999 burst on each connected /24:
 
 - A **broadcast** of the IOT.SMARTHOME `get_sysinfo` query.
 - A **paced unicast** of the same query at every IP on the subnet (~3 ms between sends).
-  Newer firmwares (e.g. KC420WS cameras) drop broadcast probes but still answer when the
+  Some devices (e.g. KC420WS cameras) drop broadcast probes but still answer when the
   packet is addressed directly. Pacing keeps the kernel/network from coalescing or
   dropping the burst.
 
@@ -141,8 +139,8 @@ setup below.
 - It scans the first H.264 frames for SPS (NAL 7) and PPS (NAL 8) and inlines them into
   the locally served SDP as `sprop-parameter-sets` + `profile-level-id`. This lets short
   -timeout consumers (HomeKit, browser players) pick up the codec immediately.
-- It then runs ffmpeg in codec-copy mode, re-packetizing the raw H.264 and G.711 µ-law
-  streams as RTP into a local RTSP server that Scrypted reads from.
+- It then packetizes the raw H.264 and G.711 µ-law streams as RTP itself (no ffmpeg) and
+  serves them from a local RTSP server that Scrypted reads from.
 
 ### Talk (Scrypted → camera speaker)
 
@@ -151,16 +149,14 @@ setup below.
   audio to 8 kHz mono G.711 µ-law.
 - Each 20 ms (160 byte) audio block is wrapped in a `multipart/x-mixed-replace` part with
   `Content-Type: audio/g711u` and streamed to the camera. Empty `audio/heartbeat` parts
-  are sent every 3 s during silence to keep the connection alive — same pattern the Kasa
-  app uses.
+  are sent every 3 s during silence to keep the connection alive.
 
 ### Spotlight / control plane
 
-- The Kasa app talks to the camera's "LINKIE2" RPC on port 10443 for non-streaming
-  features. Wire format: HTTPS POST `/data/LINKIE2.json`, body `application/x-www-form-
-  urlencoded` with a single `content=<base64(xor_ab(json))>` field. The XOR-AB autokey
+- Non-streaming features go through the camera's "LINKIE2" RPC on port 10443. Wire format:
+  HTTPS POST `/data/LINKIE2.json`, body `application/x-www-form-urlencoded` with a single `content=<base64(xor_ab(json))>` field. The XOR-AB autokey
   cipher is the same one used by Kasa's UDP/9999 discovery protocol.
-- On adoption (and whenever credentials change) the plugin probes these LINKIE2 endpoints
+- On adoption (and whenever credentials change) the plugin queries these LINKIE2 endpoints
   serially:
   - `smartlife.cam.ipcamera.dayNight.get_force_lamp_state` — if it returns `on`/`off`, a
     child `OnOff` light device named "<camera> Spotlight" is registered in the camera's
@@ -191,8 +187,7 @@ setup below.
   receive uses base64(plaintext), talk and LINKIE2 use md5_hex(plaintext). The plugin
   uses each in the right place.
 - LINKIE2 requests must include a `User-Agent: Kasa/...` header and the `Authorization`
-  header on the very first request — the camera silently drops requests that don't look
-  enough like the official app.
+  header on the very first request — the camera silently drops requests without them.
 - The camera presents a self-signed TLS certificate; certificate verification is disabled.
 - **One live stream connection per camera.** The camera serves a single client on the live
   stream (`/https/stream/mixed` on port 19443); a second connection opens at the TCP level but
