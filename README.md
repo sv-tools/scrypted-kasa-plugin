@@ -78,6 +78,9 @@ base that holds the relay protocol:
   `ColorSettingHsv` for color bulbs and `ColorSettingTemperature` for variable-temperature
   bulbs.
 
+Plugs, switches and dimmers that report a status LED get a **Status LED** toggle in their
+Settings.
+
 Devices with energy monitoring (HS110, KP115, KP125, EP25, ...) show live power, voltage,
 current and total energy on their Settings and Readme tabs, plus today's and this month's
 usage. The Readme tab also lists daily usage for the last 30 days and monthly usage for the

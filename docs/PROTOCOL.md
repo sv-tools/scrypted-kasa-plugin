@@ -170,6 +170,7 @@ response: {"system":{"set_relay_state":{"err_code":0}}}
 | ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Read state                                       | `{"system":{"get_sysinfo":{}}}`                                              | system info, as in discovery                                        |
 | Relay on/off (plugs, switches, dimmers)          | `{"system":{"set_relay_state":{"state":1}}}` (`0` = off)                     | `err_code`                                                          |
+| Status LED (plugs, switches, dimmers)            | `{"system":{"set_led_off":{"off":1}}}` (`0` = LED on)                        | `err_code`; current state is `led_off` in `get_sysinfo`             |
 | Dimmer brightness                                | `{"smartlife.iot.dimmer":{"set_brightness":{"brightness":N}}}`, N = 1–100    | `err_code`                                                          |
 | Energy reading (devices with `ENE` in `feature`) | `{"emeter":{"get_realtime":{}}}`                                             | see below                                                           |
 | Daily energy totals for one month                | `{"emeter":{"get_daystat":{"year":2026,"month":11}}}`                        | see below                                                           |
@@ -508,6 +509,27 @@ An HTTP status of 400 or higher is a transport-level failure.
 - A request on a kept-alive connection the camera closed while idle fails with a reset;
   retry it once on a new connection.
 - Typical timeout: 5 s.
+- Several modules can go in one request, and the reply carries a result for each, e.g.
+  `{"smartlife.cam.ipcamera.led":{"get_status":{}},"smartlife.cam.ipcamera.switch":{"get_is_enable":{}}}`.
+  A module the camera lacks answers `-10008` without failing the others. Only one method per
+  module is answered: with two methods of the same module in one request, only the last one
+  gets a reply.
+
+#### Camera system info
+
+`{"system":{"get_sysinfo":{}}}` (top-level `system`, not under `smartlife.cam.ipcamera.`)
+returns the camera's identity and a few states in one reply, nested under `system`:
+
+```json
+{"system":{"get_sysinfo":{"system":{
+  "model":"KC410S(US)","alias":"Kitchen","type":"IOT.IPCAMERA","hw_ver":"1.0",
+  "dev_name":"Kasa Cam, 24/7 Recording","resolution":"1080P","rssi":-30,
+  "led_status":"off","camera_switch":"on","system_time":1794375629,
+  "last_activity_timestamp":1778606993,"updating":false,"status":"configured", …
+},"err_code":0}}}
+```
+
+`led_status` matches `led.get_status`, and `camera_switch` matches `switch.get_is_enable`.
 
 #### LINKIE2 methods
 
@@ -572,14 +594,14 @@ The codes are the same on KC410S, KC420WS and KD110.
 
 ## Tested devices
 
-| Device                        | Model              | What is used                                                                           |
-| ----------------------------- | ------------------ | -------------------------------------------------------------------------------------- |
-| Pan/tilt camera               | KC410S(US)         | stream, snapshot, audio-only stream, talk, LED, siren, camera on/off, pan/tilt, motion |
-| Outdoor camera with spotlight | KC420WS            | stream, snapshot, talk, LED, spotlight, siren, camera on/off, motion                   |
-| Video doorbell                | KD110              | stream, snapshot, motion (including doorbell press as motion)                          |
-| Other cameras                 | KC200, KC401, EC71 | stream and talk                                                                        |
-| Energy-monitoring plug        | EP25(US)           | relay, energy monitoring, discovery                                                    |
-| 3-way dimmer switch           | KS230              | relay, brightness, dimmer detection by `dev_name`                                      |
+| Device                        | Model              | What is used                                                                    |
+| ----------------------------- | ------------------ | ------------------------------------------------------------------------------- |
+| Pan/tilt camera               | KC410S(US)         | stream, snapshot, audio-only stream, talk, LED, camera on/off, pan/tilt, motion |
+| Outdoor camera with spotlight | KC420WS            | stream, snapshot, talk, LED, spotlight, siren, camera on/off, motion            |
+| Video doorbell                | KD110              | stream, snapshot, motion (including doorbell press as motion)                   |
+| Other cameras                 | KC200, KC401, EC71 | stream and talk                                                                 |
+| Energy-monitoring plug        | EP25(US)           | relay, energy monitoring, discovery                                             |
+| 3-way dimmer switch           | KS230              | relay, brightness, dimmer detection by `dev_name`                               |
 
 ## References
 

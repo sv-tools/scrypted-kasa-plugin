@@ -27,6 +27,7 @@ const kwh = (wh: number) => `${(wh / 1000).toFixed(3)} kWh`;
 //
 // Wire protocol (TCP/9999):
 //   on/off:    {"system":{"set_relay_state":{"state":1|0}}}
+//   LED:       {"system":{"set_led_off":{"off":1|0}}}
 //   query:     {"system":{"get_sysinfo":{}}}
 //
 // Multi-outlet strips (HS300, KP303) aren't modeled — they need per-child relay handling.
@@ -43,8 +44,21 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
         },
     });
 
+    // The device's own status LED, from sysinfo.led_off. Undefined until a poll has seen the
+    // field; devices without it don't get the setting.
+    private ledOff?: boolean;
+
     async getSettings(): Promise<Setting[]> {
         const base = await this.storageSettings.getSettings();
+        if (this.ledOff !== undefined) {
+            base.push({
+                key: 'statusLed',
+                title: 'Status LED',
+                description: "The device's own indicator light. Off keeps it dark regardless of the relay state.",
+                type: 'boolean',
+                value: !this.ledOff,
+            });
+        }
         if (!this.storageSettings.values.hasEmeter) return base;
 
         // Devices with an emeter get a live readout block + a Refresh button so the user
@@ -110,6 +124,13 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key === 'statusLed') {
+            const off = !(value === true || value === 'true');
+            await this.callIot({ system: { set_led_off: { off: off ? 1 : 0 } } });
+            this.ledOff = off;
+            await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+            return;
+        }
         if (key === 'refreshEnergy') {
             // Drop the cached value and fetch fresh; the new reading goes back into the
             // cache so subsequent renders see it. Emit a Settings event so the UI knows
@@ -277,6 +298,7 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
         if (this.storageSettings.values.hasEmeter !== hasEmeter) {
             this.storageSettings.values.hasEmeter = hasEmeter;
         }
+        if (typeof sys.led_off === 'number') this.ledOff = sys.led_off === 1;
         // Subclasses with extra state extend via onSysInfo hook.
         this.onSysInfo(sys);
     }
