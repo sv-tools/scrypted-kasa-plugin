@@ -111,7 +111,7 @@ export async function getSysInfo(options: KasaIotOptions): Promise<KasaSysInfoCo
 //   newer:  { voltage_mv, current_ma, power_mw, total_wh, err_code }
 //   older:  { voltage,    current,    power,    total,    err_code }   // V, A, W, kWh
 //
-// Normalize to a single V/A/W/Wh shape so callers don't care which firmware they're on.
+// Normalize to a single V/A/W/Wh shape so callers don't care which schema the device uses.
 // Returns undefined on err_code or when neither schema matches.
 export interface EmeterReading {
     voltageV: number;
@@ -141,4 +141,61 @@ export async function getEmeterRealtime(options: KasaIotOptions): Promise<Emeter
         };
     }
     return undefined;
+}
+
+// The plug's own local date. Energy history below is keyed by it, so "today" has to come from
+// here rather than the host clock, which may be in another time zone or off by a few minutes
+// around midnight.
+export interface PlugDate {
+    year: number;
+    month: number;
+    day: number;
+}
+
+export async function getPlugDate(options: KasaIotOptions): Promise<PlugDate | undefined> {
+    const r = await kasaIotCall(options, { time: { get_time: {} } });
+    const t = r?.time?.get_time;
+    if (!t || t.err_code || typeof t.year !== 'number') return undefined;
+    return { year: t.year, month: t.month, day: t.mday };
+}
+
+// Daily and monthly energy totals the plug keeps itself (the Kasa app's usage charts). One
+// request carries both: get_daystat for one month and get_monthstat for one year. Days and
+// months without usage are left out of the lists. Totals come as energy_wh, or as `energy` in
+// kWh on devices that use the base-unit schema of get_realtime.
+export interface EnergyStat {
+    year: number;
+    month: number;
+    day?: number;
+    wh: number;
+}
+
+export async function getEnergyStats(
+    options: KasaIotOptions,
+    days: { year: number; month: number },
+    monthsOfYear: number,
+): Promise<{ days: EnergyStat[]; months: EnergyStat[] }> {
+    const r = await kasaIotCall(options, {
+        emeter: { get_daystat: { year: days.year, month: days.month }, get_monthstat: { year: monthsOfYear } },
+    });
+    return {
+        days: parseEnergyStats(r?.emeter?.get_daystat, 'day_list'),
+        months: parseEnergyStats(r?.emeter?.get_monthstat, 'month_list'),
+    };
+}
+
+function parseEnergyStats(result: any, listKey: string): EnergyStat[] {
+    if (!result || result.err_code || !Array.isArray(result[listKey])) return [];
+    const stats: EnergyStat[] = [];
+    for (const e of result[listKey]) {
+        const wh =
+            typeof e?.energy_wh === 'number'
+                ? e.energy_wh
+                : typeof e?.energy === 'number'
+                  ? e.energy * 1000
+                  : undefined;
+        if (wh === undefined || typeof e.year !== 'number' || typeof e.month !== 'number') continue;
+        stats.push({ year: e.year, month: e.month, day: typeof e.day === 'number' ? e.day : undefined, wh });
+    }
+    return stats;
 }
