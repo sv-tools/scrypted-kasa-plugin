@@ -78,6 +78,12 @@ base that holds the relay protocol:
   `ColorSettingHsv` for color bulbs and `ColorSettingTemperature` for variable-temperature
   bulbs.
 
+Devices with energy monitoring (HS110, KP115, KP125, EP25, ...) show live power, voltage,
+current and total energy on their Settings and Readme tabs, plus today's and this month's
+usage. The Readme tab also lists daily usage for the last 30 days and monthly usage for the
+last 12 months, read from the totals the plug keeps itself, so no history is stored in
+Scrypted.
+
 Multi-outlet plug strips (HS300, KP303) aren't modeled yet — discovery skips them.
 
 [docs/PROTOCOL.md](docs/PROTOCOL.md) documents every endpoint the plugin uses, in enough

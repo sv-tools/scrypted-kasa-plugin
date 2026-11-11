@@ -166,13 +166,16 @@ response: {"system":{"set_relay_state":{"err_code":0}}}
 
 ### Commands
 
-| Purpose                                          | Request                                                                      | Result                       |
-| ------------------------------------------------ | ---------------------------------------------------------------------------- | ---------------------------- |
-| Read state                                       | `{"system":{"get_sysinfo":{}}}`                                              | system info, as in discovery |
-| Relay on/off (plugs, switches, dimmers)          | `{"system":{"set_relay_state":{"state":1}}}` (`0` = off)                     | `err_code`                   |
-| Dimmer brightness                                | `{"smartlife.iot.dimmer":{"set_brightness":{"brightness":N}}}`, N = 1–100    | `err_code`                   |
-| Energy reading (devices with `ENE` in `feature`) | `{"emeter":{"get_realtime":{}}}`                                             | see below                    |
-| Bulb state change                                | `{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{…}}}` | new light state              |
+| Purpose                                          | Request                                                                      | Result                                                              |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Read state                                       | `{"system":{"get_sysinfo":{}}}`                                              | system info, as in discovery                                        |
+| Relay on/off (plugs, switches, dimmers)          | `{"system":{"set_relay_state":{"state":1}}}` (`0` = off)                     | `err_code`                                                          |
+| Dimmer brightness                                | `{"smartlife.iot.dimmer":{"set_brightness":{"brightness":N}}}`, N = 1–100    | `err_code`                                                          |
+| Energy reading (devices with `ENE` in `feature`) | `{"emeter":{"get_realtime":{}}}`                                             | see below                                                           |
+| Daily energy totals for one month                | `{"emeter":{"get_daystat":{"year":2026,"month":11}}}`                        | see below                                                           |
+| Monthly energy totals for one year               | `{"emeter":{"get_monthstat":{"year":2026}}}`                                 | see below                                                           |
+| Device clock                                     | `{"time":{"get_time":{}}}`                                                   | `{"year","month","mday","hour","min","sec","err_code"}`, local time |
+| Bulb state change                                | `{"smartlife.iot.smartbulb.lightingservice":{"transition_light_state":{…}}}` | new light state                                                     |
 
 For plugs, switches and dimmers, poll `get_sysinfo` for state: `relay_state` (`1` on) and,
 on dimmers, `brightness`. Nothing is pushed; the plugin polls every 30 s to pick up changes
@@ -191,6 +194,28 @@ made in the Kasa app or with the physical button.
 
 Check which keys are present rather than relying on the model. A non-zero `err_code` means no
 reading.
+
+The plug also keeps its own usage history, which is what the Kasa app's charts show:
+
+```json
+{"emeter":{"get_daystat":{"day_list":[
+  {"year":2026,"month":11,"day":9,"energy_wh":21},
+  {"year":2026,"month":11,"day":10,"energy_wh":4}],"err_code":0}}}
+
+{"emeter":{"get_monthstat":{"month_list":[
+  {"year":2026,"month":7,"energy_wh":1052},
+  {"year":2026,"month":11,"energy_wh":118}],"err_code":0}}}
+```
+
+- Both `year` and `month` are required for `get_daystat`; without them it answers `err_code`
+  `-3` "invalid argument".
+- Days and months without usage are left out of the lists; treat a missing entry as 0.
+- Devices that use the base-unit schema report `energy` in kWh instead of `energy_wh`.
+- Dates are the plug's local dates. Take "today" from `time.get_time` rather than from the
+  client's clock, which may be in another time zone.
+- Several methods of one module can go in one request, e.g.
+  `{"emeter":{"get_daystat":{…},"get_monthstat":{…}}}`, and the reply carries both. A
+  method can only appear once per request, so two months of daily totals take two requests.
 
 ### Bulbs
 

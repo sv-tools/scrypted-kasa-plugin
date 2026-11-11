@@ -1,8 +1,25 @@
 import { OnOff, ScryptedInterface, Setting, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { renderKv } from '../shared/readme';
+import { singleFlight } from '../shared/single-flight';
 import { IOT_NETWORK_SETTINGS, KasaIotBase } from './base';
-import { EmeterReading, getEmeterRealtime, getSysInfo } from './protocol';
+import { EmeterReading, EnergyStat, getEmeterRealtime, getEnergyStats, getPlugDate, getSysInfo } from './protocol';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HISTORY_DAYS = 30;
+const HISTORY_MONTHS = 12;
+
+// Usage history from the plug's own daily and monthly totals, newest first. Days and months
+// the plug has no entry for count as 0, since it leaves out the ones without usage.
+interface EnergyHistory {
+    todayWh: number;
+    monthWh: number;
+    days: [string, number][];
+    months: [string, number][];
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+const kwh = (wh: number) => `${(wh / 1000).toFixed(3)} kWh`;
 
 // Shared base for every Kasa "smarthome" single-relay device — outlets, switches, and
 // dimmers. Only the on/off relay protocol lives here; dimmable devices add Brightness on
@@ -34,7 +51,9 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
         // can force a fresh sample without waiting for the 5 s cache to expire. Reads go
         // through the same cached emeterRealtime() the Readme uses, so opening the
         // Settings tab right after viewing the Readme is free.
+        // One after the other: parallel connections to one plug occasionally lose a reply.
         const reading = await this.emeterRealtime();
+        const history = await this.energyHistory();
         const energy: Setting[] = [
             {
                 key: 'energyPower',
@@ -65,10 +84,25 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
                 value: reading ? `${(reading.totalWh / 1000).toFixed(3)} kWh` : '?',
             },
             {
+                key: 'energyToday',
+                group: 'Energy',
+                title: 'Today',
+                readonly: true,
+                value: history ? kwh(history.todayWh) : '?',
+            },
+            {
+                key: 'energyMonth',
+                group: 'Energy',
+                title: 'This month',
+                readonly: true,
+                description: 'Daily and monthly history is on the Readme tab.',
+                value: history ? kwh(history.monthWh) : '?',
+            },
+            {
                 key: 'refreshEnergy',
                 group: 'Energy',
                 title: 'Refresh',
-                description: 'Discard the cached emeter sample and read fresh values from the device.',
+                description: 'Discard the cached energy readings and read fresh values from the device.',
                 type: 'button',
             },
         ];
@@ -81,7 +115,9 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
             // cache so subsequent renders see it. Emit a Settings event so the UI knows
             // to re-render with the updated readout fields.
             this.emeterCache = undefined;
+            this.energyHistoryCache = undefined;
             await this.emeterRealtime();
+            await this.energyHistory();
             await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
             return;
         }
@@ -111,7 +147,29 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
                       ['Current', '?'],
                       ['Total', '?'],
                   ];
+            const history = await this.energyHistory();
+            rows.push(
+                ['Today', history ? kwh(history.todayWh) : '?'],
+                ['This month', history ? kwh(history.monthWh) : '?'],
+            );
             lines.push('## Energy', '', '```', renderKv(rows), '```', '');
+            if (history) {
+                const table = (entries: [string, number][]) => renderKv(entries.map(([k, wh]) => [k, kwh(wh)]));
+                lines.push(
+                    `## Daily usage (last ${HISTORY_DAYS} days)`,
+                    '',
+                    '```',
+                    table(history.days),
+                    '```',
+                    '',
+                    `## Monthly usage (last ${HISTORY_MONTHS} months)`,
+                    '',
+                    '```',
+                    table(history.months),
+                    '```',
+                    '',
+                );
+            }
         }
 
         lines.push(
@@ -145,6 +203,57 @@ export abstract class KasaIotDevice extends KasaIotBase implements OnOff {
         const value = await this.emeterInFlight;
         this.emeterCache = { value, at: Date.now() };
         return value;
+    }
+
+    // Building it takes three requests and the totals move slowly, so it's cached longer than
+    // the live reading.
+    private static ENERGY_HISTORY_CACHE_MS = 60_000;
+    private energyHistoryCache?: { value: EnergyHistory | undefined; at: number };
+    private loadEnergyHistory = singleFlight(async () => {
+        const value = await this.fetchEnergyHistory().catch(() => undefined);
+        this.energyHistoryCache = { value, at: Date.now() };
+        return value;
+    });
+
+    async energyHistory(): Promise<EnergyHistory | undefined> {
+        const cached = this.energyHistoryCache;
+        if (cached && Date.now() - cached.at < KasaIotDevice.ENERGY_HISTORY_CACHE_MS) return cached.value;
+        return this.loadEnergyHistory();
+    }
+
+    private async fetchEnergyHistory(): Promise<EnergyHistory | undefined> {
+        const options = this.iotOptions();
+        const today = await getPlugDate(options);
+        if (!today) return undefined;
+        const prevMonth =
+            today.month === 1 ? { year: today.year - 1, month: 12 } : { year: today.year, month: today.month - 1 };
+        // The last 30 days reach into the previous month, and the last 12 months into the
+        // previous year; one request covers each pair.
+        const current = await getEnergyStats(options, today, today.year);
+        const previous = await getEnergyStats(options, prevMonth, today.year - 1);
+
+        const byKey = new Map<string, number>();
+        const key = (s: EnergyStat) =>
+            s.day ? `${s.year}-${pad2(s.month)}-${pad2(s.day)}` : `${s.year}-${pad2(s.month)}`;
+        for (const s of [...current.days, ...previous.days, ...current.months, ...previous.months]) {
+            byKey.set(key(s), s.wh);
+        }
+
+        // Walk back in UTC so local DST changes can't skip or repeat a calendar day.
+        const todayMs = Date.UTC(today.year, today.month - 1, today.day);
+        const days: [string, number][] = [];
+        for (let i = 0; i < HISTORY_DAYS; i++) {
+            const d = new Date(todayMs - i * DAY_MS);
+            const k = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+            days.push([k, byKey.get(k) ?? 0]);
+        }
+        const months: [string, number][] = [];
+        for (let i = 0; i < HISTORY_MONTHS; i++) {
+            const m = new Date(Date.UTC(today.year, today.month - 1 - i, 1));
+            const k = `${m.getUTCFullYear()}-${pad2(m.getUTCMonth() + 1)}`;
+            months.push([k, byKey.get(k) ?? 0]);
+        }
+        return { todayWh: days[0][1], monthWh: months[0][1], days, months };
     }
 
     async turnOn(): Promise<void> {
