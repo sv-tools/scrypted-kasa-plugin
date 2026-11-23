@@ -89,11 +89,8 @@ Scrypted.
 
 Multi-outlet plug strips (HS300, KP303) aren't modeled yet — discovery skips them.
 
-Some firmware updates close the local protocol: the device stops answering on TCP/9999 and
-UDP/9999, so the plugin can neither discover nor control it, and port 80 answers TP-Link's
-encrypted KLAP protocol instead (seen on a KP115(US) hardware 1.0, firmware 1.1.1 Build 250908).
-Turning on **Third-party Compatibility** in the Kasa app (**Me** tab → **Settings** →
-**Third-party Compatibility**) reopens TCP/9999 and UDP/9999, and the device works as before.
+If a device stops answering after a firmware update (seen on KP115 firmware 1.1.1), turn on
+**Third-party Compatibility** in the Kasa app (**Me** → **Settings**) to reopen TCP/UDP 9999.
 
 [docs/PROTOCOL.md](docs/PROTOCOL.md) documents every endpoint the plugin uses, in enough
 detail to write a driver in another language.
