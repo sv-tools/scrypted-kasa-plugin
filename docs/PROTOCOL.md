@@ -146,6 +146,11 @@ contains `DIM`, or `dev_name` contains `dimmer`. The last check is needed for th
   closes it after the reply. It uses a 5 s timeout.
 - Don't send concurrent requests to one device: parallel connections occasionally race and
   lose a reply.
+- Some newer firmware (seen on KP115(US) hardware 1.0, firmware 1.1.1 Build 250908) refuses TCP
+  9999, ignores the UDP 9999 discovery probe, and serves TP-Link's encrypted KLAP protocol on
+  HTTP port 80 instead (its UDP 20002 discovery record reports `"encrypt_type": "KLAP"`,
+  `"lv": 2`). Turning on **Third-party Compatibility** in the Kasa app (Me → Settings) reopens
+  TCP 9999 and UDP 9999 with the protocol described here unchanged.
 
 Framed test vector for `{"system":{"get_sysinfo":{}}}`:
 
@@ -602,6 +607,7 @@ The codes are the same on KC410S, KC420WS and KD110.
 | Other cameras                 | KC200, KC401, EC71 | stream and talk                                                                 |
 | Energy-monitoring plug        | EP25(US)           | relay, energy monitoring, discovery                                             |
 | 3-way dimmer switch           | KS230              | relay, brightness, dimmer detection by `dev_name`                               |
+| Energy-monitoring plug        | KP115(US) hw 1.0   | relay, energy monitoring, discovery (with Third-party Compatibility on)         |
 
 ## References
 
