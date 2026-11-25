@@ -89,6 +89,9 @@ Scrypted.
 
 Multi-outlet plug strips (HS300, KP303) aren't modeled yet — discovery skips them.
 
+If a device stops answering after a firmware update (seen on KP115 firmware 1.1.1), turn on
+**Third-party Compatibility** in the Kasa app (**Me** → **Settings**) to reopen TCP/UDP 9999.
+
 [docs/PROTOCOL.md](docs/PROTOCOL.md) documents every endpoint the plugin uses, in enough
 detail to write a driver in another language.
 
