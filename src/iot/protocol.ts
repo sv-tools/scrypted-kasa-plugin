@@ -11,6 +11,9 @@ import { xorDecryptInPlace, xorEncryptInPlace } from '../shared/cipher';
 
 export const KASA_IOT_PORT = 9999;
 const REQUEST_TIMEOUT_MS = 5000;
+// Real Kasa IOT JSON replies are a few KB; cap the 4-byte length prefix so a non-Kasa peer
+// (e.g. an HTTP server on a misconfigured port) fails fast instead of buffering until timeout.
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export interface KasaIotOptions {
     host: string;
@@ -60,7 +63,13 @@ export async function kasaIotCall(options: KasaIotOptions, command: Record<strin
             queuedBytes += chunk.length;
             if (queuedBytes < 4) return;
             // The 4-byte length prefix almost always arrives whole in the first chunk.
-            if (expected < 0) expected = (chunks[0].length >= 4 ? chunks[0] : Buffer.concat(chunks)).readUInt32BE(0);
+            if (expected < 0) {
+                expected = (chunks[0].length >= 4 ? chunks[0] : Buffer.concat(chunks)).readUInt32BE(0);
+                if (expected > MAX_RESPONSE_BYTES) {
+                    finish(new Error(`kasa iot response length ${expected} exceeds ${MAX_RESPONSE_BYTES} bytes`));
+                    return;
+                }
+            }
             if (queuedBytes < 4 + expected) return;
             // The joined buffer is ours alone, so decrypt it in place.
             const cipher = Buffer.concat(chunks, queuedBytes).subarray(4, 4 + expected);
