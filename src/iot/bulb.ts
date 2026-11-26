@@ -11,8 +11,8 @@ import { getSysInfo } from './protocol';
 //   is_dimmable           1 = supports brightness
 //   is_color              1 = supports hue/saturation
 //   is_variable_color_temp 1 = supports color temperature
-// Color temperature range is determined per-model; we expose the values the bulb returns
-// in `getTemperatureMinK`/`getTemperatureMaxK` and fall back to a safe pair otherwise.
+// Color temperature range is per-model and not reported by get_sysinfo; we fall back to
+// 2700-6500 K unless overridden in storage.
 export class KasaBulb extends KasaIotBase implements OnOff, Brightness, ColorSettingHsv, ColorSettingTemperature {
     storageSettings = new StorageSettings(this, {
         ...IOT_NETWORK_SETTINGS,
@@ -74,26 +74,41 @@ export class KasaBulb extends KasaIotBase implements OnOff, Brightness, ColorSet
     }
 
     async setBrightness(brightness: number): Promise<void> {
-        await this.lightState({ brightness });
-        this.brightness = brightness;
+        const level = Math.round(Math.min(100, Math.max(0, brightness)));
+        // Kasa bulbs reject brightness 0 in transition_light_state; dimming to 0 turns the bulb off.
+        if (level <= 0) {
+            await this.turnOff();
+            return;
+        }
+        await this.lightState({ brightness: level });
+        this.brightness = level;
     }
 
     async setHsv(hue: number, saturation: number, value: number): Promise<void> {
-        // Switch the bulb to color mode (mode 1) when HSV is set; without this some bulbs
+        // Scrypted's ColorHsv uses s/v in 0..1; Kasa's transition_light_state expects 0..100 integers.
+        const kasaHue = Math.round(((hue % 360) + 360) % 360);
+        const kasaSat = Math.round(Math.min(1, Math.max(0, saturation)) * 100);
+        const kasaVal = Math.round(Math.min(1, Math.max(0, value)) * 100);
+        if (kasaVal <= 0) {
+            await this.turnOff();
+            return;
+        }
+        // Switch the bulb to color mode (color_temp: 0) when HSV is set; without this some bulbs
         // ignore the hue/saturation while in color-temperature mode.
         await this.lightState({
             color_temp: 0,
-            hue,
-            saturation,
-            brightness: value,
+            hue: kasaHue,
+            saturation: kasaSat,
+            brightness: kasaVal,
         });
-        this.hsv = { h: hue, s: saturation, v: value };
-        this.brightness = value;
+        this.hsv = { h: kasaHue, s: kasaSat / 100, v: kasaVal / 100 };
+        this.brightness = kasaVal;
     }
 
     async setColorTemperature(kelvin: number): Promise<void> {
-        await this.lightState({ color_temp: kelvin });
-        this.colorTemperature = kelvin;
+        const k = Math.round(kelvin);
+        await this.lightState({ color_temp: k });
+        this.colorTemperature = k;
     }
 
     async getTemperatureMinK(): Promise<number> {
@@ -112,12 +127,26 @@ export class KasaBulb extends KasaIotBase implements OnOff, Brightness, ColorSet
         const active = ls.on_off ? ls : ls.dft_on_state || {};
         this.update('on', ls.on_off === 1);
         if (typeof active.brightness === 'number') this.update('brightness', active.brightness);
-        if (typeof active.color_temp === 'number') this.update('colorTemperature', active.color_temp);
-        if (typeof active.hue === 'number' && typeof active.saturation === 'number') {
+        // Only write colorTemperature / hsv when the bulb actually publishes those interfaces;
+        // Scrypted rejects writes to unimplemented interfaces, and Kasa reports color_temp: 0
+        // whenever a bulb is in HSV mode (or does not support variable color temperature).
+        if (
+            this.storageSettings.values.isVariableColorTemp &&
+            typeof active.color_temp === 'number' &&
+            active.color_temp > 0
+        ) {
+            this.update('colorTemperature', active.color_temp);
+        }
+        if (
+            this.storageSettings.values.isColor &&
+            typeof active.hue === 'number' &&
+            typeof active.saturation === 'number'
+        ) {
+            const brightness = typeof active.brightness === 'number' ? active.brightness : 100;
             const hsv: ColorHsv = {
                 h: active.hue,
-                s: active.saturation,
-                v: typeof active.brightness === 'number' ? active.brightness : 100,
+                s: active.saturation / 100,
+                v: brightness / 100,
             };
             const prev = this.hsv;
             if (prev?.h !== hsv.h || prev?.s !== hsv.s || prev?.v !== hsv.v) this.hsv = hsv;

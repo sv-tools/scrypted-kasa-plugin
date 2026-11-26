@@ -167,10 +167,14 @@ const KASA_CAMERA_TYPES = new Set(['IOT.IPCAMERA']);
 class Deferred<T> {
     resolve!: (value: T) => void;
     promise: Promise<T>;
+    settled = false;
 
     constructor() {
         this.promise = new Promise<T>(resolve => {
-            this.resolve = resolve;
+            this.resolve = value => {
+                this.settled = true;
+                resolve(value);
+            };
         });
     }
 }
@@ -404,6 +408,9 @@ class KasaCamera
 {
     private intercomSession?: KasaTalkSession;
     private intercomFfmpeg?: ChildProcess;
+    // Bumped on every start/stop so a startIntercom awaiting ffmpegInput/ffmpegPath cannot
+    // open a session after a newer startIntercom or stopIntercom superseded it.
+    private intercomGeneration = 0;
     // Child device objects, created on first use (see child()).
     private children = new Map<CameraChildKind, KasaCameraChild>();
     // Set while stream attempts are failing because the camera is turned off, so the
@@ -1212,6 +1219,7 @@ class KasaCamera
             );
         }
 
+        if (this.released) return e;
         if (
             autoReboot &&
             now - this.streamDownSince >= STREAM_DOWN_REBOOT_AFTER_MS &&
@@ -1239,7 +1247,7 @@ class KasaCamera
     // connect right away), false if it's still off when the hold runs out. The hold is what
     // slows the rebroadcast plugin's ~5 s retry loop during a long Privacy Mode stretch.
     private async waitForCameraOn(deadline: number): Promise<boolean> {
-        while (Date.now() < deadline) {
+        while (!this.released && Date.now() < deadline) {
             await new Promise<void>(resolve => {
                 const wake = () => {
                     clearTimeout(timer);
@@ -1249,14 +1257,14 @@ class KasaCamera
                 const timer = setTimeout(wake, Math.min(CAMERA_OFF_POLL_MS, Math.max(0, deadline - Date.now())));
                 this.cameraOffWaiters.add(wake);
             });
+            // Stop before calling linkie() if the device was released while parked; calling
+            // linkie() after release() would allocate a new kept-alive agent that is never closed.
+            if (this.released) return false;
             // The switch check can take up to the LINKIE timeout; never let it run past the
             // deadline, or the hold creeps over the Video Analysis watchdog.
             const remaining = deadline - Date.now();
             if (remaining <= 0) break;
-            const state = await Promise.race([
-                this.linkie().getCameraEnabled(),
-                new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), remaining)),
-            ]);
+            const state = await withTimeout(this.linkie().getCameraEnabled(), remaining, undefined);
             if (state === 'on') return true;
         }
         return false;
@@ -1314,7 +1322,12 @@ class KasaCamera
         // surface the kill switch to settings-change handlers via activeStreamKills.
         const kill = new Deferred<void>();
         this.activeStreamKills.add(kill);
-        kill.promise.finally(() => this.activeStreamKills.delete(kill));
+        kill.promise.finally(() => {
+            this.activeStreamKills.delete(kill);
+            // Destroy kasa here too so closeStreams() during preScanSpsPps aborts immediately
+            // instead of waiting for the scan to finish or time out before stream.kill() is wired.
+            kasa.destroy();
+        });
         kasa.body.on('close', () => kill.resolve());
         kasa.body.on('error', () => kill.resolve());
 
@@ -1341,8 +1354,13 @@ class KasaCamera
                 },
             });
         } catch (e) {
+            kill.resolve();
             kasa.destroy();
             throw e;
+        }
+        if (kill.settled || this.released) {
+            stream.kill();
+            throw new Error('Kasa camera stream closed during startup');
         }
         kill.promise.finally(() => stream.kill());
         stream.exited.then(() => kill.resolve());
@@ -1361,16 +1379,22 @@ class KasaCamera
         // (e.g. switching audio sources). Tear down any prior session first so we don't leak
         // an in-flight ffmpeg process or a half-open POST to the camera.
         await this.stopIntercom();
+        const generation = ++this.intercomGeneration;
+        if (this.released) return;
 
         // `port` from storage is the receive-stream port (19443); the talk endpoint is on a
         // separate fixed port (KASA_TALK_PORT = 18443), so we don't read it here.
         const { ip, username, password } = this.storageSettings.values;
         if (!ip || !username || !password) throw new Error('Kasa camera is not configured.');
 
+        // Resolve both inputs before opening the camera talk POST so a failed lookup or an
+        // intervening stopIntercom/startIntercom never leaves a half-open session behind.
         const ffmpegInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(
             media,
             ScryptedMimeTypes.FFmpegInput,
         );
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        if (generation !== this.intercomGeneration || this.released) return;
 
         const session = new KasaTalkSession({
             ip,
@@ -1380,12 +1404,22 @@ class KasaCamera
             console: this.console,
         });
         this.intercomSession = session;
-        await session.start();
+        try {
+            await session.start();
+        } catch (e) {
+            session.close();
+            if (this.intercomSession === session) this.intercomSession = undefined;
+            throw e;
+        }
+        if (generation !== this.intercomGeneration || this.released) {
+            session.close();
+            if (this.intercomSession === session) this.intercomSession = undefined;
+            return;
+        }
 
         // ffmpeg transcodes whatever audio Scrypted hands us (Opus/AAC/PCM/...) into raw
         // 8 kHz mono G.711 µ-law on stdout, which we chunk into 20 ms blocks and write
         // into the talk session as multipart parts.
-        const ffmpegPath = await mediaManager.getFFmpegPath();
         // -loglevel error + -nostats: without these, ffmpeg emits a `size= time= bitrate=`
         // progress line every ~0.5 s during the talkback session. On long talks that's a
         // steady stream of stderr → string allocations + log I/O for no diagnostic value.
@@ -1441,7 +1475,14 @@ class KasaCamera
             '-flush_packets', '1',
             'pipe:1',
         ];
-        const cp = child_process.spawn(ffmpegPath, args);
+        let cp: ChildProcess;
+        try {
+            cp = child_process.spawn(ffmpegPath, args);
+        } catch (e) {
+            session.close();
+            if (this.intercomSession === session) this.intercomSession = undefined;
+            throw e;
+        }
         this.intercomFfmpeg = cp;
 
         // Process-level cleanup: if our worker terminates while the intercom is active,
@@ -1498,6 +1539,12 @@ class KasaCamera
             }
         });
         cp.stderr!.on('data', d => this.console.log('intercom ffmpeg:', d.toString().trim()));
+        // Handle spawn failures (e.g. ENOENT) so they tear down the session instead of raising
+        // an unhandled 'error' event on the worker thread.
+        cp.on('error', e => {
+            this.console.warn('intercom ffmpeg error:', e.message);
+            session.close();
+        });
         cp.on('exit', () => {
             this.console.log('intercom ffmpeg exited');
             session.close();
@@ -1511,14 +1558,15 @@ class KasaCamera
             if (this.intercomSession === session) {
                 this.intercomSession = undefined;
                 this.intercomFfmpeg = undefined;
-                try {
-                    cp.kill();
-                } catch {}
             }
+            try {
+                cp.kill();
+            } catch {}
         });
     }
 
     async stopIntercom(): Promise<void> {
+        this.intercomGeneration++;
         const session = this.intercomSession;
         const cp = this.intercomFfmpeg;
         this.intercomSession = undefined;
@@ -1537,6 +1585,7 @@ class KasaCamera
     release(): void {
         this.closeStreams();
         this.released = true;
+        this.wakeCameraOffWaiters();
         if (this.privacyPoll) clearInterval(this.privacyPoll);
         this.privacyPoll = undefined;
         // Not stopMotionPoll(): the device is going away, so don't publish a final
@@ -1550,7 +1599,7 @@ class KasaCamera
 
     // Closes every live stream and the intercom. Each kill triggers cleanupAll inside
     // spawnKasaStream, which destroys the kasa connection and closes the local RTSP server.
-    private closeStreams(): void {
+    closeStreams(): void {
         for (const kill of [...this.activeStreamKills]) kill.resolve();
         // stopIntercom is async only because its signature is — the work it does is
         // synchronous, so fire-and-forget is fine.
@@ -1725,9 +1774,13 @@ class KasaPlugin
             // already instantiated, otherwise it would keep using the stale IP until
             // restarted.
             const storage = deviceManager.getDeviceStorage(nativeId);
+            const prevIp = storage?.getItem('ip');
             storage?.setItem('ip', fresh.address);
             const dev = this.devices.get(nativeId);
-            if (dev?.storageSettings) dev.storageSettings.values.ip = fresh.address;
+            if (dev?.storageSettings) {
+                dev.storageSettings.values.ip = fresh.address;
+                if (dev instanceof KasaCamera && prevIp && prevIp !== fresh.address) dev.closeStreams();
+            }
 
             updated++;
         }
